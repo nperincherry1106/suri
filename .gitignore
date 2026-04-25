@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+data/*.db
+data/*.db-journal
+*.egg-info/
+.playwright/
+gmail_token.json
+gmail_credentials.json

@@ -1,0 +1,67 @@
+---
+description: SAI v0 — single-user SMS agent. Scope, persona, and hard exclusions for any code change in this repo.
+alwaysApply: true
+---
+
+# SAI v0 working rules
+
+The full plan is in `PLAN.md` at the repo root. Read it before writing non-trivial code. These rules are the load-bearing constraints — when in doubt, defer to `PLAN.md`.
+
+## What v0 is
+A single-user SMS agent. The user (Namrita) texts a Twilio number, the agent replies. v0's only end-to-end job: scan Gmail for subscriptions → identify cancel candidates → execute one cancellation via Playwright → confirm via SMS approval token. That's it.
+
+## Stack (already chosen — do not relitigate)
+- Python 3.11+
+- FastAPI for the webhook server
+- Twilio SDK (outbound), Twilio webhook (inbound)
+- Anthropic SDK — use **Claude Sonnet 4.5** (`claude-sonnet-4-5`) for the agent loop, tool use enabled
+- google-api-python-client + google-auth (Gmail, read-only OAuth)
+- Playwright for cancellation flows
+- SQLite via stdlib `sqlite3` — no ORM
+- ngrok for local dev
+
+## Repo layout (current)
+- `PLAN.md` — full v0 build plan, the source of truth
+- `app/db.py` — SQLite schema + helpers (already implemented; reuse, don't reinvent)
+- `app/twilio_client.py` — outbound SMS sender (already implemented)
+- `app/tools/` — Gmail and Playwright tools live here (to be written)
+- `app/main.py` — FastAPI webhook + agent loop (to be written)
+- `data/sai.db` — SQLite database (gitignored)
+- `.env.example` — required env vars
+
+## Agent loop rules
+1. On inbound SMS: log to `messages` → load last ~20 turns + all `user_facts` + pending `pending_actions` → call Claude with tool use enabled.
+2. **Send "on it" before any tool call that takes >10 seconds.** Don't leave the user in silence.
+3. **High-stakes actions (cancellations, money, sending messages) always pause for explicit approval.** The cancel tool fills the flow up to the final button, stops, returns a `pending_action` with a token like `CANCEL_PELOTON_X7K2`. The agent texts: `ready to cancel Peloton ($44/mo). reply YES CANCEL_PELOTON_X7K2 to confirm.` Only after the user replies with the token does `confirm_cancellation` run.
+
+## Persona (verbatim starting point — iterate from real transcripts, not from imagination)
+See `PLAN.md` "The persona prompt" section. Key rules: warm but efficient, lowercase fine, ≤2 SMS in a row without a reason, no emoji unless she uses them first, never apologize unless you actually messed up, default to action not asking, never pretend to have done something you haven't.
+
+## Hard exclusions for v0 — DO NOT BUILD
+- Multi-user support, auth, account management
+- Any UI other than SMS (no web dashboard, no app)
+- MMS, voice messages, image attachments
+- Calendar integration (different job, later)
+- **Generalized cancellation framework** — hand-write per-service Playwright scripts. Generalization comes after 5–10 services are written by hand.
+- Vector memory / embeddings — SQLite + key-value is enough for v0
+- Tests — yes really. Test by using it. Tests come when there's a second user.
+- Deployment to a server — local + ngrok only until v0 has been used for two weeks
+
+## Code style
+- This is a prototype for an audience of one. Dirty code is fine. Resist scaffolding for hypothetical v0.1+ needs.
+- No comments unless the *why* is non-obvious.
+- Three similar lines beats a premature abstraction.
+- Don't add error handling for cases that can't happen. Validate at boundaries (Twilio webhook, Gmail API, user input).
+
+## Acceptance test
+v0 ships when this works end-to-end, once, for one real subscription:
+1. SMS "find subscriptions I'm not using" → agent replies "on it" within 5s
+2. Agent scans Gmail, returns 3–5 recurring charges within 60s
+3. SMS "cancel [service]" → agent replies with `ready to cancel ... reply YES TOKEN`
+4. SMS "YES TOKEN" → agent runs Playwright cancel → texts confirmation
+5. The subscription is actually cancelled (confirmable via cancellation email)
+
+If this works once, **stop**. Do not gold-plate.
+
+## When to throw the plan away
+Per `PLAN.md`: if after the first Claude integration the texting *feel* is wrong, stop and fix the persona before building further. The texting feel is the whole product. If Gmail scanning is too noisy, pivot to "user names the subscription" — that's a fine v0 pivot.
