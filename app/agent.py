@@ -10,6 +10,13 @@ from app import db
 from app.tools import audit, memory, outlook, reminders
 
 MODEL = "claude-sonnet-4-5"
+COMPACT_MODEL = "claude-haiku-4-5-20251001"
+
+# When more than COMPACT_THRESHOLD messages have arrived since the last
+# summary, fold the oldest half into a new summary. Keeps live history
+# bounded while preserving long-running context.
+COMPACT_THRESHOLD = 30
+COMPACT_KEEP_LIVE = 15
 
 PERSONA = """You are Suri, Namrita's personal assistant. You handle the small life-logistics
 tasks that fall through the cracks because she's overwhelmed at work.
@@ -573,6 +580,12 @@ def _system_prompt() -> str:
     truth_block = _ground_truth_block()
     facts = db.user_facts()
     sections = [PERSONA, time_block, truth_block]
+    summary = db.latest_summary()
+    if summary:
+        sections.append(
+            "Earlier conversation summary (everything before the live history "
+            f"below, last updated {summary['created_at']}):\n{summary['summary']}"
+        )
     if facts:
         facts_block = "Known about the user:\n" + "\n".join(
             f"- {k}: {v}" for k, v in facts.items()
@@ -582,8 +595,10 @@ def _system_prompt() -> str:
 
 
 def _history():
+    summary = db.latest_summary()
+    after_id = summary["covers_through_message_id"] if summary else 0
     msgs = []
-    for d, b in db.recent_messages(20):
+    for d, b in db.recent_messages(20, after_id=after_id):
         role = "user" if d == "inbound" else "assistant"
         if msgs and msgs[-1]["role"] == role:
             msgs[-1]["content"] += "\n\n" + b
@@ -595,6 +610,64 @@ def _history():
     while msgs and msgs[0]["role"] != "user":
         msgs.pop(0)
     return msgs
+
+
+def _compact_if_needed():
+    """If too many messages have accumulated since the last summary, fold the
+    older half into a new summary via Haiku. Synchronous — adds ~1-2s to the
+    triggering turn. Errors are logged and swallowed so a Haiku outage can't
+    break the user-facing turn."""
+    summary = db.latest_summary()
+    after_id = summary["covers_through_message_id"] if summary else 0
+    pending = db.messages_since(after_id=after_id, limit=COMPACT_THRESHOLD * 4)
+    if len(pending) <= COMPACT_THRESHOLD:
+        return
+
+    # Summarize everything except the most recent COMPACT_KEEP_LIVE messages
+    # so the live window still has continuity into the new summary.
+    to_summarize = pending[:-COMPACT_KEEP_LIVE]
+    last_id = to_summarize[-1][0]
+
+    transcript = "\n".join(
+        f"{'NAMRITA' if d == 'inbound' else 'SURI'}: {b}"
+        for _, d, b in to_summarize
+    )
+    prior_summary = summary["summary"] if summary else ""
+
+    prompt_parts = []
+    if prior_summary:
+        prompt_parts.append(
+            f"PREVIOUS SUMMARY (covers everything before the transcript):\n{prior_summary}\n"
+        )
+    prompt_parts.append(
+        "NEW TRANSCRIPT TO FOLD IN:\n" + transcript + "\n\n"
+        "Update the summary so it captures what's important about Namrita's "
+        "ongoing context — open threads, decisions she's made, things Suri "
+        "has done or promised, recurring themes, anything that future-Suri "
+        "needs to remember to be useful. 5-10 hyphen bullets, no preamble, "
+        "no markdown. Don't list every action — that's in the audit log."
+    )
+
+    try:
+        resp = _get_client().messages.create(
+            model=COMPACT_MODEL,
+            max_tokens=600,
+            messages=[{"role": "user", "content": "\n".join(prompt_parts)}],
+        )
+    except Exception as e:
+        print(f"[compact] failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return
+
+    new_summary = "".join(b.text for b in resp.content if b.type == "text").strip()
+    if not new_summary:
+        print("[compact] empty summary, skipping", file=sys.stderr, flush=True)
+        return
+    db.save_summary(new_summary, last_id)
+    print(
+        f"[compact] folded {len(to_summarize)} msgs through id={last_id}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _execute_tool(name: str, input_: dict, turn_id: str):
@@ -690,6 +763,7 @@ def handle(send=None) -> list[str]:
     """Run the agent loop. Calls `send(text)` for each agent message as it
     happens (so callers can stream "on it" before tool calls finish). Also
     returns the full list of messages sent."""
+    _compact_if_needed()
     messages = _history()
     sent: list[str] = []
     # One turn_id per user message → spans every tool call in this loop.

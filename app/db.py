@@ -92,6 +92,12 @@ def init():
             );
             CREATE INDEX IF NOT EXISTS idx_agent_actions_created
                 ON agent_actions(created_at DESC);
+            CREATE TABLE IF NOT EXISTS conversation_summaries (
+                id INTEGER PRIMARY KEY,
+                summary TEXT NOT NULL,
+                covers_through_message_id INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
 
@@ -106,13 +112,53 @@ def log_outbound(body: str):
         c.execute("INSERT INTO messages (direction, body) VALUES (?, ?)", ("outbound", body))
 
 
-def recent_messages(limit: int = 20):
+def recent_messages(limit: int = 20, after_id: int = 0):
     with conn() as c:
         rows = c.execute(
-            "SELECT direction, body FROM messages ORDER BY id DESC LIMIT ?",
-            (limit,),
+            "SELECT direction, body FROM messages "
+            "WHERE id > ? ORDER BY id DESC LIMIT ?",
+            (after_id, limit),
         ).fetchall()
     return [(r["direction"], r["body"]) for r in reversed(rows)]
+
+
+def messages_since(after_id: int = 0, limit: int = 1000):
+    """Return (id, direction, body) for messages with id > after_id, oldest
+    first. Used by the compaction loop to materialize what to summarize."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT id, direction, body FROM messages "
+            "WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (after_id, limit),
+        ).fetchall()
+    return [(r["id"], r["direction"], r["body"]) for r in rows]
+
+
+def latest_summary():
+    """Most recent conversation summary, or None if none exists."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT id, summary, covers_through_message_id, created_at "
+            "FROM conversation_summaries ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "summary": row["summary"],
+        "covers_through_message_id": row["covers_through_message_id"],
+        "created_at": row["created_at"],
+    }
+
+
+def save_summary(summary: str, covers_through_message_id: int):
+    with conn() as c:
+        cur = c.execute(
+            "INSERT INTO conversation_summaries (summary, covers_through_message_id) "
+            "VALUES (?, ?)",
+            (summary, covers_through_message_id),
+        )
+        return cur.lastrowid
 
 
 def user_facts():
