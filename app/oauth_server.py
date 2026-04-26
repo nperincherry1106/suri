@@ -165,16 +165,21 @@ if (!window.Plaid) {{
         headers: {{ "Content-Type": "application/json" }},
         body: JSON.stringify({{ public_token: publicToken }})
       }})
-        .then(r => r.json())
-        .then(d => {{
-          if (d.ok) {{
+        .then(async (r) => {{
+          const data = await r.json().catch(() => ({{ parse_error: true, status: r.status }}));
+          if (!r.ok) {{
+            const msg = data.detail || data.error || (data.parse_error ? "bad json from server" : JSON.stringify(data));
+            st.innerHTML = "<span class='err'>couldn't save link (HTTP " + r.status + "): " + msg + "</span>";
+            return;
+          }}
+          if (data.ok) {{
             st.innerHTML = "<span class='ok'>connected &mdash; you can close this tab. suri is ready in telegram.</span>";
             btn.remove();
           }} else {{
-            st.innerHTML = "<span class='err'>couldn't save link: " + (d.error || "unknown") + "</span>";
+            st.innerHTML = "<span class='err'>couldn't save link: " + (data.error || data.detail || JSON.stringify(data)) + "</span>";
           }}
         }})
-        .catch(e => {{
+        .catch((e) => {{
           st.innerHTML = "<span class='err'>network error: " + e + "</span>";
         }});
     }},

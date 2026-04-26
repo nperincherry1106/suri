@@ -276,6 +276,15 @@ def list_items() -> dict:
 
 def exchange_public_token(public_token: str) -> dict:
     """Server-side: exchange public_token, persist item + access token."""
+    try:
+        return _exchange_public_token_impl(public_token)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[plaid] exchange_public_token fatal: {err}", file=sys.stderr, flush=True)
+        return {"ok": False, "error": err}
+
+
+def _exchange_public_token_impl(public_token: str) -> dict:
     client = _get_client()
     if client is None:
         return {"ok": False, "error": "plaid not configured"}
@@ -288,11 +297,19 @@ def exchange_public_token(public_token: str) -> dict:
         ex = client.item_public_token_exchange(
             ItemPublicTokenExchangeRequest(public_token=public_token)
         )
-        d = ex.to_dict() if hasattr(ex, "to_dict") else (ex if isinstance(ex, dict) else {})
-        if not d and ex is not None and not isinstance(ex, dict):
-            d = {"access_token": getattr(ex, "access_token", None), "item_id": getattr(ex, "item_id", None)}
-        access = d.get("access_token")
-        item_id = d.get("item_id")
+        access = getattr(ex, "access_token", None)
+        item_id = getattr(ex, "item_id", None)
+        d: dict = {}
+        if (not access or not item_id) and hasattr(ex, "to_dict"):
+            d = ex.to_dict() or {}
+            access = access or d.get("access_token")
+            item_id = item_id or d.get("item_id")
+        if not access or not item_id:
+            return {
+                "ok": False,
+                "error": "public_token exchange returned no access_token or item_id",
+                "raw_keys": list(d.keys()) if d else "no to_dict on response",
+            }
     except Exception as e:
         return {"ok": False, "error": _plaid_error(e)}
 
@@ -300,10 +317,8 @@ def exchange_public_token(public_token: str) -> dict:
     inst_name = None
     try:
         igr = client.item_get(ItemGetRequest(access_token=access))
-        d = igr.to_dict() if hasattr(igr, "to_dict") else {}
-        if not d:
-            d = dict(igr) if igr else {}
-        item = d.get("item")
+        d2 = igr.to_dict() if hasattr(igr, "to_dict") else {}
+        item = d2.get("item")
         if item:
             iid = item.get("institution_id")
             if iid:
@@ -328,12 +343,19 @@ def exchange_public_token(public_token: str) -> dict:
     except Exception as e:
         print(f"[plaid] item_get/inst name after exchange: {e}", file=sys.stderr, flush=True)
 
-    db.upsert_plaid_item(
-        str(item_id),
-        str(access),
-        inst_id,
-        str(inst_name) if inst_name else None,
-    )
+    try:
+        db.upsert_plaid_item(
+            str(item_id),
+            str(access),
+            inst_id,
+            str(inst_name) if inst_name else None,
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"sqlite (saving item): {type(e).__name__}: {e}. Is /data volume writable?",
+        }
+
     return {
         "ok": True,
         "item_id": str(item_id),
