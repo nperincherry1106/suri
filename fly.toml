@@ -11,7 +11,7 @@
 #
 # App name is set on `fly launch`; you can rename later via `fly apps rename`.
 app = "suri"
-primary_region = "sea"  # Seattle — adjust to your nearest region
+primary_region = "sjc"  # San Jose — closest US west coast region to PT
 
 [build]
   dockerfile = "Dockerfile"

@@ -19,7 +19,7 @@ from pathlib import Path
 import msal
 import requests
 
-from app import db
+from app import db, push
 
 AUTHORITY = "https://login.microsoftonline.com/consumers"
 SCOPES = ["Mail.ReadWrite", "MailboxSettings.ReadWrite"]
@@ -64,13 +64,26 @@ def _token() -> str:
                 raise RuntimeError(
                     f"failed to start MS device-code flow: {flow}"
                 )
-            print(
+            user_code = flow["user_code"]
+            verify_url = flow.get(
+                "verification_uri", "https://www.microsoft.com/link"
+            )
+            # Log to stderr (visible via `fly logs`) AND push to telegram so
+            # she sees it on her phone without needing to tail logs.
+            stderr_msg = (
                 "\n=== OUTLOOK AUTH REQUIRED ===\n"
                 f"{flow['message']}\n"
                 "Suri is now blocked until you complete this. "
-                "After auth, the token is cached to the persistent volume.\n",
-                file=sys.stderr,
-                flush=True,
+                "After auth, the token is cached to the persistent volume.\n"
+            )
+            print(stderr_msg, file=sys.stderr, flush=True)
+            push.push(
+                "Outlook needs me to re-authenticate before I can do that.\n\n"
+                f"Open this link: {verify_url}\n"
+                f"Enter this code: {user_code}\n\n"
+                "Sign in with your Microsoft account. I'll keep waiting "
+                "(this prompt is good for ~15 min). Once you're done I'll "
+                "answer your original message."
             )
             result = app.acquire_token_by_device_flow(flow)
         else:

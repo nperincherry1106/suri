@@ -7,7 +7,9 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
-from app import agent, db, scheduler
+from app import agent, db
+from app import push as push_module
+from app import scheduler
 
 
 _app: Application | None = None
@@ -110,10 +112,10 @@ def push_threadsafe(text: str):
 async def _post_init(application: Application):
     global _loop
     _loop = asyncio.get_running_loop()
-    # Wire the scheduler's push channel to us so reminders go to telegram,
-    # not stdout. Explicit callback registration > implicit module-attribute
-    # lookup (the latter was silently failing).
-    scheduler.set_push_callback(push_threadsafe)
+    # Register us as the global push transport. Anyone (scheduler firing a
+    # reminder, outlook prompting for device-code re-auth, etc.) calls
+    # push.push() and it lands in telegram.
+    push_module.set_callback(push_threadsafe)
     # Now that the push channel is live, restore any pending reminders.
     scheduler.restore_pending()
     print(
