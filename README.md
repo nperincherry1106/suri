@@ -90,10 +90,20 @@ cp .env.example .env
 6. Open **API permissions** → Add a permission → Microsoft Graph → Delegated → check:
    - `Mail.ReadWrite`
    - `MailboxSettings.ReadWrite` (required for inbox rules)
+   - `Calendars.ReadWrite` (calendar tools)
 7. Grant admin consent (or just consent on first auth).
 8. Copy the **Application (client) ID** into `MS_CLIENT_ID` in `.env`.
 
-The first time Suri makes an Outlook call, MSAL will pop a browser tab for you to authorize. After that, the token cache (`outlook_token.json`) persists.
+The first time Suri makes an Outlook call, she'll DM you a Microsoft sign-in
+link with a short code. Tap, sign in, approve — done. The token caches to
+`outlook_token.json` (or the fly volume in production) so you only see this
+on first install and every ~90 days when refresh tokens expire.
+
+**Adding more capabilities later:** if you (or a future Suri update) need a
+new Microsoft scope that isn't in the list above, Suri detects the missing
+permission, DMs you a deep link to the right Azure portal page, and tells
+you exactly which checkbox to tick. Tap, check, save, reply "try again" —
+Suri handles the consent prompt inline. No SSH, no file deletion.
 
 ## Run
 

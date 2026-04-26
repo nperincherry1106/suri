@@ -34,6 +34,49 @@ _DATA_DIR = Path(os.environ.get("SURI_DATA_DIR", ROOT))
 TOKEN_PATH = _DATA_DIR / "outlook_token.json"
 
 
+def _azure_permissions_url(client_id: str) -> str:
+    """Deep link to the API Permissions blade for our app registration.
+    Opens directly to the page where the user adds Microsoft Graph scopes."""
+    return (
+        "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/"
+        f"ApplicationMenuBlade/~/CallAnAPI/appId/{client_id}"
+    )
+
+
+def _push_consent_request(scopes: list[str], client_id: str, error_hint: str = ""):
+    """When MSAL can't even start a device-code flow, the most likely cause
+    is that one of the requested scopes isn't declared on the Azure app.
+    DM Namrita the deep link + the exact scope names to add. She taps once,
+    adds the scope, replies — Suri retries on the next call automatically."""
+    msg = (
+        "I need a new Microsoft permission to do that.\n\n"
+        "One-time setup (~30 sec):\n"
+        f"1. Tap: {_azure_permissions_url(client_id)}\n"
+        "2. Click 'Add a permission' → Microsoft Graph → Delegated permissions\n"
+        f"3. Check the box(es) for: {', '.join(scopes)}\n"
+        "4. Click 'Add permissions' at the bottom\n"
+        "5. Reply 'try again' — I'll handle the consent prompt from there.\n\n"
+        "If the link doesn't open the right page: portal.azure.com → "
+        "Microsoft Entra ID → App registrations → your Suri app → API permissions."
+    )
+    if error_hint:
+        msg += f"\n\n(Azure said: {error_hint[:200]})"
+    push.push(msg)
+
+
+def _push_device_code(flow: dict):
+    """Friendlier device-code DM for inline consent. Triggered when a scope
+    is declared in Azure but the cached token doesn't cover it yet (incremental
+    consent), or on first auth, or when the refresh token has expired."""
+    push.push(
+        "Quick Microsoft sign-in needed (~30 sec):\n\n"
+        f"1. Tap: {flow.get('verification_uri', 'https://www.microsoft.com/link')}\n"
+        f"2. Enter code: {flow['user_code']}\n"
+        "3. Sign in and approve.\n\n"
+        "I'll keep waiting (good for ~15 min). Once done I'll finish what you asked."
+    )
+
+
 def _token() -> str:
     cache = msal.SerializableTokenCache()
     if TOKEN_PATH.exists():
@@ -53,42 +96,29 @@ def _token() -> str:
     result = None
     accounts = app.get_accounts()
     if accounts:
+        # Silent acquire only succeeds if cached token covers ALL of SCOPES.
+        # Adding a new scope to SCOPES therefore forces an incremental-consent
+        # device flow on next call — exactly the inline UX we want.
         result = app.acquire_token_silent(SCOPES, account=accounts[0])
 
     if not result:
-        # On a headless server (no display, no browser) the interactive flow
-        # would crash trying to open a browser tab. Use device-code flow
-        # instead: print a URL + short code to stderr, user opens it on their
-        # phone/laptop and enters the code. Token then persists to the volume
-        # so this only happens on first deploy + every ~90 days when refresh
-        # tokens expire.
         if os.environ.get("SURI_HEADLESS") == "1":
             flow = app.initiate_device_flow(scopes=SCOPES)
             if "user_code" not in flow:
+                # Most common cause: a scope in SCOPES isn't declared on the
+                # Azure app registration. DM the deep link + scope list and
+                # bail — there's nothing else we can do server-side.
+                err = flow.get("error_description") or flow.get("error") or str(flow)
+                print(f"[auth] initiate_device_flow failed: {err}", file=sys.stderr, flush=True)
+                _push_consent_request(SCOPES, client_id, err)
                 raise RuntimeError(
-                    f"failed to start MS device-code flow: {flow}"
+                    "outlook auth blocked: scope likely undeclared in Azure. "
+                    "Pushed inline setup link to Telegram. Reply once added."
                 )
-            user_code = flow["user_code"]
-            verify_url = flow.get(
-                "verification_uri", "https://www.microsoft.com/link"
-            )
-            # Log to stderr (visible via `fly logs`) AND push to telegram so
-            # she sees it on her phone without needing to tail logs.
-            stderr_msg = (
-                "\n=== OUTLOOK AUTH REQUIRED ===\n"
-                f"{flow['message']}\n"
-                "Suri is now blocked until you complete this. "
-                "After auth, the token is cached to the persistent volume.\n"
-            )
-            print(stderr_msg, file=sys.stderr, flush=True)
-            push.push(
-                "Outlook needs me to re-authenticate before I can do that.\n\n"
-                f"Open this link: {verify_url}\n"
-                f"Enter this code: {user_code}\n\n"
-                "Sign in with your Microsoft account. I'll keep waiting "
-                "(this prompt is good for ~15 min). Once you're done I'll "
-                "answer your original message."
-            )
+            print(f"[auth] device-code initiated for scopes: {SCOPES}",
+                  file=sys.stderr, flush=True)
+            print(flow["message"], file=sys.stderr, flush=True)
+            _push_device_code(flow)
             result = app.acquire_token_by_device_flow(flow)
         else:
             result = app.acquire_token_interactive(SCOPES)
@@ -98,9 +128,12 @@ def _token() -> str:
         TOKEN_PATH.write_text(cache.serialize())
 
     if "access_token" not in result:
-        raise RuntimeError(
-            f"outlook auth failed: {result.get('error_description', result)}"
-        )
+        # acquire_token_by_device_flow can also return a consent-required
+        # error if the scope isn't declared. Same DM applies.
+        err = result.get("error_description") or str(result)
+        if "consent" in err.lower() or "AADSTS65001" in err or "scope" in err.lower():
+            _push_consent_request(SCOPES, client_id, err)
+        raise RuntimeError(f"outlook auth failed: {err[:300]}")
     return result["access_token"]
 
 
