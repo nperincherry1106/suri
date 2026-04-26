@@ -1,11 +1,18 @@
 import asyncio
 import os
 import re
+import secrets
 import sys
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from app import agent, db
 from app import push as push_module
@@ -35,6 +42,21 @@ _MD_FENCED_CODE_RE = re.compile(r"```[a-zA-Z]*\n?", re.MULTILINE)
 _MD_BULLET_RE = re.compile(r"^(\s*)[*+]\s+", re.MULTILINE)
 
 
+# Persona instructs the agent to end any approval-gated message with a line
+# like:    [CONFIRM]: delete 5 emails from spam.com
+# We intercept it here, strip from visible text, and render Yes/No buttons.
+_CONFIRM_MARKER_RE = re.compile(r"^\s*\[CONFIRM\]:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _extract_confirm(text: str) -> tuple[str, str | None]:
+    m = _CONFIRM_MARKER_RE.search(text)
+    if not m:
+        return text, None
+    description = m.group(1).strip()
+    cleaned = _CONFIRM_MARKER_RE.sub("", text).rstrip()
+    return cleaned, description
+
+
 def strip_markdown(text: str) -> str:
     """Remove markdown syntax that Telegram doesn't render, leaving readable
     plain text. Conservative — only strips formatting marks, never content."""
@@ -54,6 +76,60 @@ def strip_markdown(text: str) -> str:
     return text
 
 
+def _make_emit(chat_id: int, bot, loop: asyncio.AbstractEventLoop):
+    """Build the agent's send-callback. Logs each reply, strips markdown,
+    and renders inline Yes/No buttons whenever the agent ends a message
+    with a [CONFIRM]: marker."""
+
+    def emit(reply: str):
+        clean = strip_markdown(reply)
+        text, confirm_desc = _extract_confirm(clean)
+        # Log the cleaned (button-stripped) text so future _history() reads
+        # see what the user actually saw.
+        db.log_outbound(text or confirm_desc or "")
+        if confirm_desc:
+            token = secrets.token_hex(4)
+            db.create_pending_action(
+                action_id=token,
+                action_type="confirm",
+                payload={"description": confirm_desc},
+            )
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Yes", callback_data=f"y:{token}"),
+                        InlineKeyboardButton("No", callback_data=f"n:{token}"),
+                    ]
+                ]
+            )
+            coro = bot.send_message(
+                chat_id=chat_id,
+                text=text or confirm_desc,
+                reply_markup=kb,
+            )
+        else:
+            coro = bot.send_message(chat_id=chat_id, text=text)
+        asyncio.run_coroutine_threadsafe(coro, loop)
+
+    return emit
+
+
+async def _run_turn(chat_id: int, text: str, bot):
+    """Shared entry point for both inbound text and button-callback synthetic
+    messages. Logs the inbound under the turn lock and runs the agent."""
+    if _turn_lock is None:
+        raise RuntimeError("telegram bot not initialized: _turn_lock is None")
+    loop = asyncio.get_running_loop()
+    emit = _make_emit(chat_id, bot, loop)
+    async with _turn_lock:
+        db.log_inbound(text)
+        try:
+            await asyncio.to_thread(agent.handle, emit)
+        except Exception as e:
+            print(f"[telegram] agent error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            await bot.send_message(chat_id=chat_id, text=f"[error: {type(e).__name__}: {e}]")
+
+
 async def _on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user is None or update.effective_user.id != _allowed_user_id():
         # Silently ignore anyone who isn't the allowlisted user.
@@ -68,29 +144,51 @@ async def _on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     bot = context.bot
-    loop = asyncio.get_running_loop()
     # TYPING outside the lock so the user sees activity even if a previous
     # turn is still running.
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    await _run_turn(chat_id, text, bot)
 
-    def emit(reply: str):
-        clean = strip_markdown(reply)
-        db.log_outbound(clean)
-        asyncio.run_coroutine_threadsafe(
-            bot.send_message(chat_id=chat_id, text=clean), loop
-        )
 
-    if _turn_lock is None:
-        raise RuntimeError("telegram bot not initialized: _turn_lock is None")
-    async with _turn_lock:
-        # Log inbound INSIDE the lock so the previous turn's _history() read
-        # has already completed before this message becomes visible to it.
-        db.log_inbound(text)
+async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Yes/No taps on inline confirmation buttons. Translates the tap
+    into a synthetic user message ("yes — confirmed via button: ...") and
+    runs the agent loop so it can act on the approval."""
+    cq = update.callback_query
+    if cq is None or cq.from_user is None or cq.from_user.id != _allowed_user_id():
+        return
+    await cq.answer()  # dismiss the loading spinner
+    data = cq.data or ""
+    if ":" not in data:
+        return
+    verdict, token = data.split(":", 1)
+    pending = db.get_pending_action(token)
+    if pending is None:
         try:
-            await asyncio.to_thread(agent.handle, emit)
-        except Exception as e:
-            print(f"[telegram] agent error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-            await bot.send_message(chat_id=chat_id, text=f"[error: {type(e).__name__}: {e}]")
+            await cq.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    if pending["status"] != "pending":
+        # Already handled — strip the buttons and bail.
+        try:
+            await cq.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    new_status = "confirmed" if verdict == "y" else "declined"
+    db.update_pending_action_status(token, new_status)
+    try:
+        await cq.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    description = (pending["payload"] or {}).get("description", "")
+    word = "yes" if verdict == "y" else "no"
+    synthetic = f"{word} — {new_status} via button: {description}"
+    chat_id = cq.message.chat_id if cq.message else _allowed_user_id()
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    await _run_turn(chat_id, synthetic, context.bot)
 
 
 async def push(text: str):
@@ -151,6 +249,7 @@ def main():
 
     _app = Application.builder().token(token).post_init(_post_init).build()
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_message))
+    _app.add_handler(CallbackQueryHandler(_on_callback))
 
     print("[telegram] starting polling...", file=sys.stderr, flush=True)
     try:
