@@ -131,7 +131,10 @@ async def run_turn(text: str, chat_id: int | None = None) -> None:
             await asyncio.to_thread(agent.handle, emit)
         except Exception as e:
             print(f"[telegram] agent error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-            await bot.send_message(chat_id=chat_id, text=f"[error: {type(e).__name__}: {e}]")
+            detail = f"{type(e).__name__}: {e}"
+            if len(detail) > 3500:
+                detail = detail[:3490] + "…"
+            await bot.send_message(chat_id=chat_id, text=f"[error: {detail}]")
 
 
 async def _on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):

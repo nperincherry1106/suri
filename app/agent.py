@@ -4,7 +4,7 @@ import sys
 import uuid
 from datetime import datetime
 
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 
 from app import accounts, db
 from app.tools import audit, memory, outlook, reminders
@@ -773,6 +773,20 @@ def _history():
     return msgs
 
 
+def _anthropic_transcript_plausible(msgs: list) -> bool:
+    """Claude's API requires non-empty, user-first, alternating user/assistant
+    messages. Corrupt persisted state (e.g. duplicate user, wrong role) gets
+    400s — this catches the common breakages before we call the API."""
+    if not isinstance(msgs, list) or not msgs:
+        return False
+    if msgs[0].get("role") != "user":
+        return False
+    for i in range(len(msgs) - 1):
+        if msgs[i].get("role") == msgs[i + 1].get("role"):
+            return False
+    return True
+
+
 def _load_messages_for_turn() -> list:
     """Prefer the last turn's full Anthropic messages (with tool results).
     If missing or looks corrupt, fall back to text-only _history()."""
@@ -784,7 +798,16 @@ def _load_messages_for_turn() -> list:
     body = db.latest_inbound_body()
     if not body:
         return _history()
-    return state + [{"role": "user", "content": body}]
+    out = state + [{"role": "user", "content": body}]
+    if not _anthropic_transcript_plausible(out):
+        print(
+            "[agent] persisted conversation_state failed transcript check; "
+            "using text-only _history()",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _history()
+    return out
 
 
 def _compact_if_needed():
@@ -975,14 +998,39 @@ def handle(send=None) -> list[str]:
     # One turn_id per user message → spans every tool call in this loop.
     # Lets the audit log group "what happened in response to that ask".
     turn_id = uuid.uuid4().hex[:12]
+    first_api_in_turn = True
+    recovered_persisted_state = False
     while True:
-        resp = _get_client().messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=_system_prompt(),
-            messages=messages,
-            tools=TOOLS,
-        )
+        try:
+            resp = _get_client().messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                system=_system_prompt(),
+                messages=messages,
+                tools=TOOLS,
+            )
+        except APIStatusError as e:
+            # Bad persisted tool transcript (or oversized payload) — recover once
+            # at the *start* of a turn, then re-build from text-only _history().
+            if (
+                e.status_code in (400, 404, 413, 422)
+                and first_api_in_turn
+                and not recovered_persisted_state
+                and db.get_conversation_messages() is not None
+            ):
+                print(
+                    f"[agent] messages.create {e.status_code} "
+                    f"({str(e)[:200]}); clearing conversation_state, "
+                    "retrying on text history",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                db.clear_conversation_state()
+                messages = _history()
+                recovered_persisted_state = True
+                continue
+            raise
+        first_api_in_turn = False
         text = "".join(b.text for b in resp.content if b.type == "text").strip()
         if text:
             sent.append(text)
