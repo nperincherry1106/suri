@@ -11,6 +11,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# `sqlite3` CLI — not needed at runtime (app uses stdlib sqlite3) but fly ssh
+# one-liners and ad-hoc DB inspection use it; without it, fly logs show:
+#   ERROR ... exec: "sqlite3": executable file not found in $PATH
+RUN apt-get update && apt-get install -y --no-install-recommends sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
