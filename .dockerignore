@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.env
+.env.*
+data/
+outlook_token.json
+.DS_Store
+.cursor
+README.md
+PLAN.md
+*.md

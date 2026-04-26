@@ -1,0 +1,33 @@
+# fly.toml — Suri deployment config.
+#
+# Notes:
+#   - No [http_service]: Suri doesn't accept inbound HTTP. The Telegram bot
+#     polls outbound, so we don't need a public listener.
+#   - Single machine, no auto-stop: the Telegram long-poll connection can only
+#     have ONE active client per bot token. Two machines polling the same bot
+#     would produce 409 Conflicts every few seconds.
+#   - 1GB RAM: Chromium (used for unsubscribe pages) needs the headroom.
+#   - Volume at /data: SQLite db + outlook_token.json persist across deploys.
+#
+# App name is set on `fly launch`; you can rename later via `fly apps rename`.
+app = "suri"
+primary_region = "sea"  # Seattle — adjust to your nearest region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  SURI_HEADLESS = "1"
+  SURI_DATA_DIR = "/data"
+  TZ = "America/Los_Angeles"
+
+[mounts]
+  source = "suri_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+[deploy]
+  strategy = "immediate"  # don't try rolling — there's only one machine

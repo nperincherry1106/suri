@@ -1,9 +1,14 @@
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "data" / "sai.db"
+# Where to store the SQLite db and other persistent state.
+# In production (fly.io) this is mounted as a volume at /data.
+# Locally it defaults to <repo>/data/.
+_DATA_DIR = Path(os.environ.get("SURI_DATA_DIR", Path(__file__).parent.parent / "data"))
+DB_PATH = _DATA_DIR / "sai.db"
 
 
 @contextmanager

@@ -25,7 +25,9 @@ AUTHORITY = "https://login.microsoftonline.com/consumers"
 SCOPES = ["Mail.ReadWrite", "MailboxSettings.ReadWrite"]
 GRAPH = "https://graph.microsoft.com/v1.0"
 ROOT = Path(__file__).parent.parent.parent
-TOKEN_PATH = ROOT / "outlook_token.json"
+# Token cache lives next to the SQLite db (so on fly it lands on the volume).
+_DATA_DIR = Path(os.environ.get("SURI_DATA_DIR", ROOT))
+TOKEN_PATH = _DATA_DIR / "outlook_token.json"
 
 
 def _token() -> str:
@@ -48,10 +50,34 @@ def _token() -> str:
     accounts = app.get_accounts()
     if accounts:
         result = app.acquire_token_silent(SCOPES, account=accounts[0])
+
     if not result:
-        result = app.acquire_token_interactive(SCOPES)
+        # On a headless server (no display, no browser) the interactive flow
+        # would crash trying to open a browser tab. Use device-code flow
+        # instead: print a URL + short code to stderr, user opens it on their
+        # phone/laptop and enters the code. Token then persists to the volume
+        # so this only happens on first deploy + every ~90 days when refresh
+        # tokens expire.
+        if os.environ.get("SURI_HEADLESS") == "1":
+            flow = app.initiate_device_flow(scopes=SCOPES)
+            if "user_code" not in flow:
+                raise RuntimeError(
+                    f"failed to start MS device-code flow: {flow}"
+                )
+            print(
+                "\n=== OUTLOOK AUTH REQUIRED ===\n"
+                f"{flow['message']}\n"
+                "Suri is now blocked until you complete this. "
+                "After auth, the token is cached to the persistent volume.\n",
+                file=sys.stderr,
+                flush=True,
+            )
+            result = app.acquire_token_by_device_flow(flow)
+        else:
+            result = app.acquire_token_interactive(SCOPES)
 
     if cache.has_state_changed:
+        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
         TOKEN_PATH.write_text(cache.serialize())
 
     if "access_token" not in result:
