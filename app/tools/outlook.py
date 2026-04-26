@@ -22,7 +22,11 @@ import requests
 from app import db, push
 
 AUTHORITY = "https://login.microsoftonline.com/consumers"
-SCOPES = ["Mail.ReadWrite", "MailboxSettings.ReadWrite"]
+# Adding a scope requires the user to (1) consent to it in Azure portal
+# (Mail.ReadWrite already exists; add Calendars.ReadWrite under API
+# permissions for the same app) and (2) delete outlook_token.json so MSAL
+# re-prompts. Until both happen, calendar tools will return 403.
+SCOPES = ["Mail.ReadWrite", "MailboxSettings.ReadWrite", "Calendars.ReadWrite"]
 GRAPH = "https://graph.microsoft.com/v1.0"
 ROOT = Path(__file__).parent.parent.parent
 # Token cache lives next to the SQLite db (so on fly it lands on the volume).
@@ -1296,3 +1300,251 @@ def find_paid_subscriptions(days_back: int = 90, max_results: int = 500):
 
     results.sort(key=sort_key)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Calendar
+# ---------------------------------------------------------------------------
+#
+# Requires the Calendars.ReadWrite delegated scope. If it isn't consented yet,
+# Graph returns 403 and we surface a clear hint. To enable: add the scope in
+# Azure → Suri app → API permissions, then delete outlook_token.json so MSAL
+# re-prompts on the next call.
+
+_DEFAULT_TZ = "America/Los_Angeles"
+_DEFAULT_WORK_START = 9   # 9am
+_DEFAULT_WORK_END = 18    # 6pm
+
+
+def _calendar_403(action: str) -> dict:
+    return {
+        "ok": False,
+        "error": (
+            f"calendar {action} got 403 from Graph. The Calendars.ReadWrite "
+            "scope likely isn't consented yet. Tell Namrita to (1) add "
+            "Calendars.ReadWrite delegated permission in Azure → her Suri "
+            "app → API permissions, then (2) delete outlook_token.json and "
+            "let the next call re-prompt."
+        ),
+    }
+
+
+def list_events(days_ahead: int = 7, days_back: int = 0):
+    """List calendar events in [now - days_back, now + days_ahead]. Returns
+    each event normalized to a flat dict with start/end as ISO strings in
+    Pacific (the user's primary tz)."""
+    token = _token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Prefer": f'outlook.timezone="{_DEFAULT_TZ}"',
+    }
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days_back)
+    end = now + timedelta(days=days_ahead)
+    params = {
+        "startDateTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endDateTime": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "$top": "100",
+        "$orderby": "start/dateTime",
+        "$select": "id,subject,start,end,location,attendees,isAllDay,bodyPreview,organizer,isCancelled",
+    }
+    r = requests.get(f"{GRAPH}/me/calendarView", headers=headers, params=params, timeout=30)
+    if r.status_code == 403:
+        return _calendar_403("read")
+    if r.status_code >= 400:
+        return {"ok": False, "error": f"list_events failed ({r.status_code}): {r.text[:300]}"}
+    out = []
+    for e in r.json().get("value", []):
+        if e.get("isCancelled"):
+            continue
+        out.append(
+            {
+                "event_id": e.get("id"),
+                "subject": e.get("subject"),
+                "start": (e.get("start") or {}).get("dateTime"),
+                "end": (e.get("end") or {}).get("dateTime"),
+                "is_all_day": e.get("isAllDay", False),
+                "location": (e.get("location") or {}).get("displayName"),
+                "organizer": ((e.get("organizer") or {}).get("emailAddress") or {}).get("address"),
+                "attendees": [
+                    {
+                        "email": (a.get("emailAddress") or {}).get("address"),
+                        "name": (a.get("emailAddress") or {}).get("name"),
+                        "response": (a.get("status") or {}).get("response"),
+                    }
+                    for a in (e.get("attendees") or [])
+                ],
+                "preview": (e.get("bodyPreview") or "")[:200],
+            }
+        )
+    return {"ok": True, "count": len(out), "events": out}
+
+
+def find_free_time(
+    duration_minutes: int,
+    days_ahead: int = 7,
+    work_hours_only: bool = True,
+    work_start_hour: int = _DEFAULT_WORK_START,
+    work_end_hour: int = _DEFAULT_WORK_END,
+):
+    """Find calendar gaps of at least `duration_minutes` over the next
+    `days_ahead` days. Returns up to 10 candidate slots in Pacific time.
+
+    If work_hours_only=True (default), constrains to [work_start_hour,
+    work_end_hour) and skips Sat/Sun. Treats all-day events as fully busy
+    for that day."""
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(_DEFAULT_TZ)
+    listing = list_events(days_ahead=days_ahead, days_back=0)
+    if isinstance(listing, dict) and not listing.get("ok"):
+        return listing
+    events = listing["events"]
+
+    def _parse(ts: str) -> datetime:
+        # Graph returns wall-time strings under our timezone Prefer header.
+        # No offset → attach our tz.
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts.endswith("Z") else datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+
+    busy_by_day: dict[str, list[tuple[datetime, datetime]]] = {}
+    for e in events:
+        start_s, end_s = e.get("start"), e.get("end")
+        if not start_s or not end_s:
+            continue
+        s, en = _parse(start_s), _parse(end_s)
+        if e.get("is_all_day"):
+            day = s.date().isoformat()
+            busy_by_day.setdefault(day, []).append(
+                (datetime.combine(s.date(), datetime.min.time(), tzinfo=tz),
+                 datetime.combine(s.date(), datetime.max.time(), tzinfo=tz))
+            )
+        else:
+            day = s.date().isoformat()
+            busy_by_day.setdefault(day, []).append((s, en))
+
+    duration = timedelta(minutes=duration_minutes)
+    now_local = datetime.now(tz)
+    results: list[dict] = []
+    for offset in range(days_ahead + 1):
+        day_dt = (now_local + timedelta(days=offset)).date()
+        if work_hours_only and day_dt.weekday() >= 5:
+            continue
+        day_start = datetime.combine(day_dt, datetime.min.time(), tzinfo=tz)
+        if work_hours_only:
+            window_start = day_start.replace(hour=work_start_hour)
+            window_end = day_start.replace(hour=work_end_hour)
+        else:
+            window_start = day_start
+            window_end = day_start + timedelta(days=1)
+        # Don't suggest slots in the past for today.
+        if window_start < now_local:
+            window_start = now_local.replace(second=0, microsecond=0) + timedelta(minutes=5)
+        if window_start >= window_end:
+            continue
+
+        busy = sorted(busy_by_day.get(day_dt.isoformat(), []))
+        cursor = window_start
+        for b_start, b_end in busy:
+            b_start = max(b_start, window_start)
+            b_end = min(b_end, window_end)
+            if b_start >= b_end:
+                continue
+            if b_start - cursor >= duration:
+                results.append({"start": cursor.isoformat(), "end": (cursor + duration).isoformat()})
+                if len(results) >= 10:
+                    break
+            cursor = max(cursor, b_end)
+        if len(results) >= 10:
+            break
+        if window_end - cursor >= duration:
+            results.append({"start": cursor.isoformat(), "end": (cursor + duration).isoformat()})
+        if len(results) >= 10:
+            break
+
+    return {
+        "ok": True,
+        "duration_minutes": duration_minutes,
+        "timezone": _DEFAULT_TZ,
+        "work_hours": [work_start_hour, work_end_hour] if work_hours_only else None,
+        "slots": results,
+    }
+
+
+def create_event(
+    title: str,
+    start_iso: str,
+    end_iso: str,
+    attendees: list[str] | None = None,
+    body: str = "",
+    location: str = "",
+):
+    """Create a calendar event. start_iso/end_iso must be ISO 8601 with tz
+    offset. attendees is a list of email addresses. Get explicit user
+    approval (via [CONFIRM]) before calling — this sends invites."""
+    token = _token()
+    payload: dict = {
+        "subject": title,
+        "start": {"dateTime": start_iso, "timeZone": _DEFAULT_TZ},
+        "end": {"dateTime": end_iso, "timeZone": _DEFAULT_TZ},
+    }
+    # Graph accepts ISO with tz offset directly, but if it carries an offset
+    # we strip the timeZone hint to avoid double-interpretation.
+    if "+" in start_iso[10:] or start_iso.endswith("Z"):
+        payload["start"] = {"dateTime": start_iso, "timeZone": "UTC" if start_iso.endswith("Z") else _DEFAULT_TZ}
+    if body:
+        payload["body"] = {"contentType": "text", "content": body}
+    if location:
+        payload["location"] = {"displayName": location}
+    if attendees:
+        payload["attendees"] = [
+            {"emailAddress": {"address": a}, "type": "required"} for a in attendees
+        ]
+
+    r = requests.post(
+        f"{GRAPH}/me/events",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    if r.status_code == 403:
+        return _calendar_403("create")
+    if r.status_code >= 400:
+        return {"ok": False, "error": f"create_event failed ({r.status_code}): {r.text[:300]}"}
+    j = r.json()
+    return {
+        "ok": True,
+        "event_id": j.get("id"),
+        "web_link": j.get("webLink"),
+        "subject": j.get("subject"),
+        "start": (j.get("start") or {}).get("dateTime"),
+        "end": (j.get("end") or {}).get("dateTime"),
+        "note": (
+            f"event created. invites sent to {len(attendees or [])} attendee(s). "
+            "view/edit/cancel from Outlook calendar or via cancel_event."
+        ),
+    }
+
+
+def cancel_event(event_id: str):
+    """Cancel/delete an event. For events with attendees this sends
+    cancellation notices automatically."""
+    token = _token()
+    r = requests.delete(
+        f"{GRAPH}/me/events/{event_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    if r.status_code == 403:
+        return _calendar_403("cancel")
+    if r.status_code in (200, 204):
+        return {"ok": True, "event_id": event_id, "note": "event cancelled."}
+    if r.status_code == 404:
+        return {"ok": False, "event_id": event_id, "error": "no event with that id"}
+    return {
+        "ok": False,
+        "event_id": event_id,
+        "error": f"cancel failed ({r.status_code}): {r.text[:300]}",
+    }

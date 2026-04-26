@@ -443,6 +443,89 @@ TOOLS = [
         },
     },
     {
+        "name": "list_events",
+        "description": (
+            "List Namrita's calendar events in the next N days (and "
+            "optionally past M days). Returns subject, start, end, "
+            "location, attendees, and event_id (use with cancel_event).\n\n"
+            "Use for 'what's on my calendar' / 'what do I have today' / "
+            "'when am I free Friday'. Times are in Pacific."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days_ahead": {"type": "integer", "description": "Default 7."},
+                "days_back": {"type": "integer", "description": "Default 0."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "find_free_time",
+        "description": (
+            "Find calendar gaps of at least duration_minutes in the next "
+            "days_ahead days. Defaults: weekday 9am-6pm Pacific, skips "
+            "weekends. Returns up to 10 candidate slots.\n\n"
+            "WORKFLOW: use when she asks 'when am I free for X' / 'find "
+            "me 30 min this week'. Show top 3-5 slots, let her pick, then "
+            "call create_event."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "duration_minutes": {"type": "integer"},
+                "days_ahead": {"type": "integer", "description": "Default 7."},
+                "work_hours_only": {"type": "boolean", "description": "Default true (skip weekends, constrain to work hours)."},
+                "work_start_hour": {"type": "integer", "description": "Default 9."},
+                "work_end_hour": {"type": "integer", "description": "Default 18."},
+            },
+            "required": ["duration_minutes"],
+        },
+    },
+    {
+        "name": "create_event",
+        "description": (
+            "Create a calendar event and (if attendees) send invites.\n\n"
+            "WORKFLOW: HIGH STAKES. Always show the proposed event in chat "
+            "(title, time, attendees) and gate with [CONFIRM] before "
+            "calling. After it returns ok:true, share the web_link so she "
+            "can verify in Outlook.\n\n"
+            "start_iso/end_iso must be ISO 8601 with tz offset, e.g. "
+            "'2026-04-26T14:00:00-07:00'. Use the 'Current time' line in "
+            "your system prompt as anchor."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "start_iso": {"type": "string"},
+                "end_iso": {"type": "string"},
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Email addresses.",
+                },
+                "body": {"type": "string", "description": "Optional event body."},
+                "location": {"type": "string", "description": "Optional location string."},
+            },
+            "required": ["title", "start_iso", "end_iso"],
+        },
+    },
+    {
+        "name": "cancel_event",
+        "description": (
+            "Cancel/delete a calendar event by id (from list_events). For "
+            "events with attendees this AUTOMATICALLY sends cancellation "
+            "notices — never call without explicit approval. Gate with "
+            "[CONFIRM] when there are attendees."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"event_id": {"type": "string"}},
+            "required": ["event_id"],
+        },
+    },
+    {
         "name": "remember_fact",
         "description": (
             "Save a long-term fact about Namrita to persistent memory. Use "
@@ -758,6 +841,30 @@ def _execute_tool(name: str, input_: dict, turn_id: str):
         result = outlook.list_inbox_rules()
     elif name == "delete_inbox_rule":
         result = outlook.delete_inbox_rule(input_["rule_id"])
+    elif name == "list_events":
+        result = outlook.list_events(
+            days_ahead=input_.get("days_ahead", 7),
+            days_back=input_.get("days_back", 0),
+        )
+    elif name == "find_free_time":
+        result = outlook.find_free_time(
+            duration_minutes=input_["duration_minutes"],
+            days_ahead=input_.get("days_ahead", 7),
+            work_hours_only=input_.get("work_hours_only", True),
+            work_start_hour=input_.get("work_start_hour", 9),
+            work_end_hour=input_.get("work_end_hour", 18),
+        )
+    elif name == "create_event":
+        result = outlook.create_event(
+            title=input_["title"],
+            start_iso=input_["start_iso"],
+            end_iso=input_["end_iso"],
+            attendees=input_.get("attendees"),
+            body=input_.get("body", ""),
+            location=input_.get("location", ""),
+        )
+    elif name == "cancel_event":
+        result = outlook.cancel_event(input_["event_id"])
     elif name == "remember_fact":
         result = memory.remember_fact(input_["key"], input_["value"])
     elif name == "forget_fact":
