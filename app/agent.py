@@ -49,6 +49,16 @@ Behavior:
   and should then execute the action immediately. If she taps No, drop it.
   Use [CONFIRM] for ANY gated action (drafts, deletes, blocks, rules,
   subscription cancels). Don't use it for plain questions ("did you mean X?").
+- POST-CONFIRMATION RULE (HARD): When you receive a message starting with
+  "yes — confirmed via button: ...", the action you queued is already
+  approved. You MUST execute the destructive tool call(s) in this same
+  turn. If you need IDs you don't have in context (e.g. the message_ids
+  for the emails you proposed deleting), call the lookup tool AND THEN
+  call the destructive tool in the same turn — do NOT stop after the
+  lookup with "let me pull those" / "give me a sec". One turn from Yes
+  to done. After the destructive calls return, summarize the outcome
+  by ground truth (e.g. "deleted 14 of 15 — Hyatt promo bounced because
+  X").
 - If a step takes >10 seconds, send a short "on it" first.
 - If she tells you a preference worth keeping ("I hate phone calls", "never
   unsubscribe me from USPS", "my partner is Alex"), call remember_fact so you
@@ -746,6 +756,20 @@ def _history():
     return msgs
 
 
+def _load_messages_for_turn() -> list:
+    """Prefer the last turn's full Anthropic messages (with tool results).
+    If missing or looks corrupt, fall back to text-only _history()."""
+    state = db.get_conversation_messages()
+    if not state or not isinstance(state, list) or not state:
+        return _history()
+    if state[-1].get("role") != "assistant":
+        return _history()
+    body = db.latest_inbound_body()
+    if not body:
+        return _history()
+    return state + [{"role": "user", "content": body}]
+
+
 def _compact_if_needed():
     """If too many messages have accumulated since the last summary, fold the
     older half into a new summary via Haiku. Synchronous — adds ~1-2s to the
@@ -797,8 +821,10 @@ def _compact_if_needed():
         print("[compact] empty summary, skipping", file=sys.stderr, flush=True)
         return
     db.save_summary(new_summary, last_id)
+    db.clear_conversation_state()
     print(
-        f"[compact] folded {len(to_summarize)} msgs through id={last_id}",
+        f"[compact] folded {len(to_summarize)} msgs through id={last_id} "
+        "(text-only history; tool state cleared for next turn)",
         file=sys.stderr,
         flush=True,
     )
@@ -927,7 +953,7 @@ def handle(send=None) -> list[str]:
     happens (so callers can stream "on it" before tool calls finish). Also
     returns the full list of messages sent."""
     _compact_if_needed()
-    messages = _history()
+    messages = _load_messages_for_turn()
     sent: list[str] = []
     # One turn_id per user message → spans every tool call in this loop.
     # Lets the audit log group "what happened in response to that ask".
@@ -947,6 +973,18 @@ def handle(send=None) -> list[str]:
                 send(text)
 
         if resp.stop_reason != "tool_use":
+            if any(b.type in ("text", "tool_use") for b in resp.content):
+                messages.append(
+                    {"role": "assistant", "content": _serialize(resp.content)}
+                )
+            try:
+                db.set_conversation_messages(messages)
+            except Exception as e:
+                print(
+                    f"[agent] conversation_state save failed: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             return sent
 
         messages.append({"role": "assistant", "content": _serialize(resp.content)})

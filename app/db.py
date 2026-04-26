@@ -106,6 +106,14 @@ def init():
                 covers_through_message_id INTEGER NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            -- Single row: the exact Anthropic messages[] array (incl. tool_use /
+            -- tool_result blocks) as of the end of the last completed agent turn.
+            -- Without this, _history() is text-only and the model can't see
+            -- message_ids from a prior triage on the next turn.
+            CREATE TABLE IF NOT EXISTS conversation_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                messages_json TEXT NOT NULL
+            );
             """
         )
 
@@ -167,6 +175,41 @@ def save_summary(summary: str, covers_through_message_id: int):
             (summary, covers_through_message_id),
         )
         return cur.lastrowid
+
+
+def get_conversation_messages() -> list | None:
+    """The persisted Anthropic messages[] from the end of the last turn, or
+    None if we should fall back to text-only _history()."""
+    with conn() as c:
+        row = c.execute("SELECT messages_json FROM conversation_state WHERE id = 1").fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["messages_json"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def set_conversation_messages(msgs: list):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO conversation_state (id, messages_json) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET messages_json = excluded.messages_json",
+            (json.dumps(msgs, default=str),),
+        )
+
+
+def clear_conversation_state():
+    with conn() as c:
+        c.execute("DELETE FROM conversation_state WHERE id = 1")
+
+
+def latest_inbound_body() -> str | None:
+    with conn() as c:
+        row = c.execute(
+            "SELECT body FROM messages WHERE direction = 'inbound' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return None if row is None else row["body"]
 
 
 def user_facts():
@@ -302,6 +345,7 @@ def list_failed_unsubscribes():
 def clear_message_history():
     with conn() as c:
         c.execute("DELETE FROM messages")
+    clear_conversation_state()
 
 
 def find_marketing_senders_match(query: str):
