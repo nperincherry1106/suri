@@ -79,6 +79,14 @@ def morning_brief():
         print(f"[proactive:morning] triage failed: {type(e).__name__}: {e}",
               file=sys.stderr, flush=True)
         items = []
+    try:
+        owed = outlook.find_owed_replies(days_threshold=2, lookback_days=14)
+        if isinstance(owed, dict) and not owed.get("ok", True):
+            owed = []
+    except Exception as e:
+        print(f"[proactive:morning] owed-replies failed: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+        owed = []
     pending = db.list_pending_reminders()
     today = datetime.now().astimezone().date().isoformat()
     today_reminders = [r for r in pending if (r["fire_at"] or "")[:10] == today]
@@ -89,14 +97,17 @@ def morning_brief():
         "date": today,
         "inbox_last_12h_excluding_marketing": real_items,
         "marketing_noise_count": marketing_count,
+        "owed_replies_2d_plus": owed[:10],
         "reminders_firing_today": today_reminders,
     }
     user_msg = (
         "Compose Namrita's morning brief. Hyphen-list bullets. Sections (omit "
         "any that have no content):\n"
-        "- needs your attention: real human emails, urgent / time-sensitive\n"
-        "- waiting on you: emails where she's the last addressee and hasn't replied\n"
-        "- on your plate today: reminders scheduled for today\n"
+        "- needs your attention: real human emails, urgent / time-sensitive "
+        "(from inbox_last_12h_excluding_marketing)\n"
+        "- waiting on you: from owed_replies_2d_plus, sender + short subject "
+        "+ N days waiting\n"
+        "- on your plate today: reminders firing today\n"
         "- noise: one-line summary of marketing volume (e.g. '12 marketing — "
         "want me to triage?')\n\n"
         "Be specific (sender + 3-word subject hint), never vague. If "

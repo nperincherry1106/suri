@@ -156,6 +156,34 @@ TOOLS = [
         },
     },
     {
+        "name": "find_owed_replies",
+        "description": (
+            "Find inbox threads where Namrita is the one who owes a reply: "
+            "the most recent message is from someone else, she was addressed "
+            "(to/cc), it's older than days_threshold, and it's not marketing. "
+            "Sorted oldest-first by days_waiting.\n\n"
+            "WORKFLOW: Use when she asks 'what do I owe' / 'what am I behind "
+            "on' / 'who's waiting on me'. Also auto-included in the morning "
+            "brief — don't repeat unless she asks. After calling, surface as "
+            "'X people waiting on you for N+ days', list top 3-5 by sender + "
+            "subject. Offer to draft replies."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days_threshold": {
+                    "type": "integer",
+                    "description": "Min days waited before counting as owed. Default 2.",
+                },
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "How many days of inbox to scan. Default 14.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "get_thread",
         "description": (
             "Fetch the full conversation containing a message_id so you can "
@@ -700,6 +728,11 @@ def _execute_tool(name: str, input_: dict, turn_id: str):
     elif name == "get_thread":
         result = outlook.get_thread(
             input_["message_id"], max_messages=input_.get("max_messages", 10)
+        )
+    elif name == "find_owed_replies":
+        result = outlook.find_owed_replies(
+            days_threshold=input_.get("days_threshold", 2),
+            lookback_days=input_.get("lookback_days", 14),
         )
     elif name == "delete_email":
         result = outlook.delete_email(input_["message_id"])

@@ -790,6 +790,115 @@ def triage_inbox(hours_back: int = 24, max_results: int = 30):
     return out
 
 
+_my_address_cache: str | None = None
+
+
+def _get_my_address(token: str) -> str:
+    """Resolve Namrita's own email address. Cached for the process lifetime —
+    it doesn't change. Used by find_owed_replies to decide whose turn it is
+    in a thread."""
+    global _my_address_cache
+    if _my_address_cache:
+        return _my_address_cache
+    r = requests.get(
+        f"{GRAPH}/me",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    j = r.json()
+    addr = (j.get("mail") or j.get("userPrincipalName") or "").lower()
+    _my_address_cache = addr
+    return addr
+
+
+def find_owed_replies(days_threshold: int = 2, lookback_days: int = 14):
+    """Inbox threads where Namrita was addressed (to/cc), the most recent
+    message is from someone else, it's older than `days_threshold` days,
+    and it's not marketing. Sorted by days_waiting desc.
+
+    Returns one row per conversation, capped at the most recent 200 inbox
+    messages within `lookback_days`."""
+    token = _token()
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        my_addr = _get_my_address(token)
+    except Exception as e:
+        return {"ok": False, "error": f"could not resolve own address: {type(e).__name__}: {e}"}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    params = {
+        "$top": "200",
+        "$select": (
+            "id,conversationId,from,toRecipients,ccRecipients,"
+            "subject,receivedDateTime,internetMessageHeaders"
+        ),
+        "$orderby": "receivedDateTime desc",
+        "$filter": f"receivedDateTime ge {cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+    }
+    r = requests.get(
+        f"{GRAPH}/me/mailFolders/inbox/messages",
+        headers=headers,
+        params=params,
+        timeout=60,
+    )
+    r.raise_for_status()
+    messages = r.json().get("value", [])
+
+    # Keep only the most recent message per conversation.
+    by_conv: dict[str, dict] = {}
+    for m in messages:
+        conv = m.get("conversationId")
+        if not conv:
+            continue
+        existing = by_conv.get(conv)
+        if existing is None or m["receivedDateTime"] > existing["receivedDateTime"]:
+            by_conv[conv] = m
+
+    threshold = datetime.now(timezone.utc) - timedelta(days=days_threshold)
+    now_utc = datetime.now(timezone.utc)
+    results = []
+    for conv, m in by_conv.items():
+        from_field = (m.get("from") or {}).get("emailAddress", {}) or {}
+        from_addr = (from_field.get("address") or "").lower()
+        # Most recent message must not be from her (or empty/unknown).
+        if not from_addr or from_addr == my_addr:
+            continue
+        # Skip marketing — List-Unsubscribe header present.
+        url, _ = _extract_unsubscribe(m.get("internetMessageHeaders"))
+        if url:
+            continue
+        try:
+            received = datetime.fromisoformat(m["receivedDateTime"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if received > threshold:
+            continue
+        # She must be addressed (to or cc).
+        addressed = False
+        for recip in (m.get("toRecipients") or []) + (m.get("ccRecipients") or []):
+            if (recip.get("emailAddress", {}).get("address") or "").lower() == my_addr:
+                addressed = True
+                break
+        if not addressed:
+            continue
+
+        results.append(
+            {
+                "conversation_id": conv,
+                "message_id": m["id"],
+                "from_name": from_field.get("name"),
+                "from_email": from_addr,
+                "subject": m.get("subject"),
+                "received_at": m["receivedDateTime"],
+                "days_waiting": (now_utc - received).days,
+            }
+        )
+
+    results.sort(key=lambda r: r["days_waiting"], reverse=True)
+    return results
+
+
 def get_thread(message_id: str, max_messages: int = 10):
     """Fetch all messages in the conversation containing message_id, so the
     agent can summarize the thread. Returns ordered oldest -> newest, each with
