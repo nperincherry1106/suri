@@ -7,7 +7,7 @@ from datetime import datetime
 from anthropic import Anthropic, APIStatusError
 
 from app import accounts, db
-from app.tools import audit, memory, outlook, reminders
+from app.tools import audit, memory, outlook, plaid as plaid_tool, reminders
 from app.tools.outlook import OutlookAuthRequired
 
 MODEL = "claude-sonnet-4-5"
@@ -304,11 +304,13 @@ TOOLS = [
     {
         "name": "find_paid_subscriptions",
         "description": (
-            "Scan Namrita's inbox over the last N days for receipts, "
+            "Scan Namrita's Outlook inbox over the last N days for receipts, "
             "renewals, and invoices to estimate what she's currently paying "
-            "for. DETECTION ONLY — does NOT cancel anything. If she asks to "
-            "cancel a paid sub, say plainly that you can't do that yet. "
-            "Takes ~10-30 seconds."
+            "for. DETECTION ONLY — does NOT cancel anything. This is the "
+            "EMAIL-based signal. For money that actually left her card/bank, "
+            "use plaid_sync_transactions and plaid_recurring (after she has "
+            "linked via plaid_start_link). If she asks to cancel a paid sub, say "
+            "plainly that you can't do that yet. Takes ~10-30 seconds."
         ),
         "input_schema": {
             "type": "object",
@@ -638,6 +640,56 @@ TOOLS = [
         },
     },
     {
+        "name": "plaid_start_link",
+        "description": (
+            "Read-only bank/card onboarding via Plaid. Returns connect_url; "
+            "the result also includes say_this_to_namrita (step-by-step — paste "
+            "or adapt it so she is not lost). Suri only gets transaction read "
+            "data through Plaid, not wire/transfer power. Plaid can link "
+            "multiple institutions in one flow when the user is offered 'add another'. "
+            "After she finishes in the browser: plaid_list_items, then sync/recurring. "
+            "Requires server Plaid + SURI_PUBLIC_URL. Say 'on it' if needed."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "plaid_list_items",
+        "description": (
+            "List Plaid-linked institutions (item ids, names). No secrets. Use "
+            "to see whether she has any bank data connected yet."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "plaid_sync_transactions",
+        "description": (
+            "Run Plaid /transactions/sync for all linked items (or one item_id) "
+            "and return how many new transactions were added plus a small sample. "
+            "Call before plaid_recurring if she just linked or if you need fresh "
+            "tx. May take 10-30+ seconds; say 'on it' if needed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item_id": {
+                    "type": "string",
+                    "description": "Optional: sync only this Plaid item_id; omit for all items.",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "plaid_recurring",
+        "description": (
+            "Fetch Plaid recurring transaction streams (inflow/outflow) for "
+            "all linked items. This is the CARD/BANK view of regular charges — "
+            "complement, not replace, find_paid_subscriptions (email). If empty, "
+            "she may need more transaction history; try plaid_sync_transactions first."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "set_reminder",
         "description": (
             "Schedule a reminder pushed to Namrita's Telegram at the given "
@@ -722,6 +774,18 @@ def _ground_truth_block() -> str:
         parts.append(f"Active scheduled reminders:\n{lines}")
     else:
         parts.append("Active scheduled reminders: NONE.")
+
+    plaid_rows = db.list_plaid_items_public()
+    if plaid_rows:
+        lines = "\n".join(
+            f"  - {p.get('institution_name') or p['item_id']} (item_id {p['item_id']})"
+            for p in plaid_rows
+        )
+        parts.append(f"Plaid (banks/cards) linked — this is REALITY:\n{lines}")
+    else:
+        parts.append(
+            "Plaid (read-only tx data) linked: NONE — use plaid_start_link if she wants card/bank-side data."
+        )
 
     # Recent tool calls — collapses to a per-tool count + failures so the
     # block stays short. For the full payload the agent should call
@@ -957,6 +1021,14 @@ def _execute_tool(name: str, input_: dict, turn_id: str):
         result = memory.remember_fact(input_["key"], input_["value"])
     elif name == "forget_fact":
         result = memory.forget_fact(input_["key"])
+    elif name == "plaid_start_link":
+        result = plaid_tool.start_link()
+    elif name == "plaid_list_items":
+        result = plaid_tool.list_items()
+    elif name == "plaid_sync_transactions":
+        result = plaid_tool.sync_transactions(input_.get("item_id"))
+    elif name == "plaid_recurring":
+        result = plaid_tool.fetch_recurring()
     elif name == "set_reminder":
         result = reminders.set_reminder(input_["when_iso"], input_["body"])
     elif name == "list_reminders":

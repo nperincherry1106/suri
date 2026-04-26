@@ -1,0 +1,11 @@
+---
+description: Namrita should not have to write app code or run deploys; the agent implements and ships.
+alwaysApply: true
+---
+
+# Who does what (Suri repo)
+
+- **The agent (Cursor):** implements changes in this repo, runs terminal commands, `git` when needed, `fly deploy` / `fly secrets` (when the environment allows), and fixes CI. Prefer doing the work over instructing the user to copy-paste.
+- **Namrita:** product direction, testing in Telegram, and anything only a human account can do (Plaid/Azure/Google dashboard, MFA, typing approval tokens, **never paste live secrets into chat** — local `.env` + `fly secrets set` on her machine, or the agent runs those commands without echoing values).
+
+- **No expectation** that she edits `app/`, `Dockerfile`, or Fly config by hand unless she wants to. When she says ship / deploy / fix it, treat that as: implement and deploy when possible.

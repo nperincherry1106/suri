@@ -4,7 +4,9 @@ This is intentionally NOT a separate database table — the source of truth is
 each provider's token cache on disk. Adding a parallel DB row would create
 a sync invariant ("row says connected, token is gone" = lying to the user).
 We probe the actual sources every turn, the same way _ground_truth_block()
-queries the messages/reminders/etc. tables fresh.
+queries the messages/reminders/etc. tables fresh. For Plaid, rows in
+`plaid_items` (token in SQLite) are the source of truth for whether a bank
+is linked.
 
 Promote to a real `connected_accounts` table the moment any of these is
 true:
@@ -14,6 +16,7 @@ true:
 
 Until then, this 30-line module is the right shape.
 """
+from app import db
 from app.tools import outlook
 
 
@@ -26,6 +29,16 @@ def connected() -> list[dict]:
                 "provider": "outlook",
                 "account_email": outlook.cached_account_email(),
                 "scopes": list(outlook.SCOPES),
+            }
+        )
+    for p in db.list_plaid_items_public():
+        out.append(
+            {
+                "provider": "plaid",
+                "account_email": p.get("institution_name") or p.get("item_id"),
+                "scopes": [
+                    f"plaid:item:{p['item_id']}",
+                ],
             }
         )
     return out
@@ -41,12 +54,14 @@ def status_block() -> str:
             "You have no integrations connected yet. Email, calendar, etc. "
             "are unavailable until she connects them. The connect flow is "
             "automatic — the first time you call a provider tool, Suri's "
-            "OAuth handler pushes a one-tap link to her chat. Don't claim "
-            "you can do anything that needs a connection she hasn't done."
+            "OAuth handler pushes a one-tap link to her chat. For Plaid "
+            "(card/bank data), call plaid_start_link; she must open a browser "
+            "link and SURI_PUBLIC_URL must be set. Don't claim you can do "
+            "anything that needs a connection she hasn't done."
         )
     lines = "\n".join(
         f"  - {a['provider']} ({a['account_email'] or 'unknown account'}) "
-        f"— scopes: {', '.join(a['scopes'])}"
+        f"— {', '.join(a['scopes'])}"
         for a in accts
     )
     return (

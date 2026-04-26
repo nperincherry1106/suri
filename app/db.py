@@ -114,6 +114,20 @@ def init():
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 messages_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS plaid_items (
+                item_id TEXT PRIMARY KEY,
+                access_token TEXT NOT NULL,
+                institution_id TEXT,
+                institution_name TEXT,
+                cursor TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS plaid_link_sessions (
+                id TEXT PRIMARY KEY,
+                link_token TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
 
@@ -602,3 +616,101 @@ def prune_expired_oauth(older_than_minutes: int = 60):
             "WHERE created_at < datetime('now', ?)",
             (f"-{older_than_minutes} minutes",),
         )
+
+
+# --- Plaid ------------------------------------------------------------------
+
+
+def create_plaid_link_session(session_id: str, link_token: str):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO plaid_link_sessions (id, link_token) VALUES (?, ?)",
+            (session_id, link_token),
+        )
+
+
+def get_plaid_link_session(session_id: str):
+    with conn() as c:
+        row = c.execute(
+            "SELECT id, link_token, created_at FROM plaid_link_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "link_token": row["link_token"],
+        "created_at": row["created_at"],
+    }
+
+
+def delete_plaid_link_session(session_id: str):
+    with conn() as c:
+        c.execute("DELETE FROM plaid_link_sessions WHERE id = ?", (session_id,))
+
+
+def prune_stale_plaid_link_sessions(older_than_minutes: int = 20):
+    with conn() as c:
+        c.execute(
+            "DELETE FROM plaid_link_sessions WHERE created_at < datetime('now', ?)",
+            (f"-{older_than_minutes} minutes",),
+        )
+
+
+def upsert_plaid_item(
+    item_id: str,
+    access_token: str,
+    institution_id: str | None,
+    institution_name: str | None,
+):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO plaid_items (item_id, access_token, institution_id, institution_name) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(item_id) DO UPDATE SET "
+            "  access_token = excluded.access_token, "
+            "  institution_id = excluded.institution_id, "
+            "  institution_name = excluded.institution_name, "
+            "  updated_at = CURRENT_TIMESTAMP",
+            (item_id, access_token, institution_id, institution_name),
+        )
+
+
+def set_plaid_cursor(item_id: str, cursor: str | None):
+    with conn() as c:
+        c.execute(
+            "UPDATE plaid_items SET cursor = ?, updated_at = CURRENT_TIMESTAMP WHERE item_id = ?",
+            (cursor, item_id),
+        )
+
+
+def get_plaid_item(item_id: str):
+    with conn() as c:
+        row = c.execute("SELECT * FROM plaid_items WHERE item_id = ?", (item_id,)).fetchone()
+    if row is None:
+        return None
+    return {
+        "item_id": row["item_id"],
+        "access_token": row["access_token"],
+        "institution_id": row["institution_id"],
+        "institution_name": row["institution_name"],
+        "cursor": row["cursor"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def list_plaid_items_public():
+    """Institution info only — no access_token."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT item_id, institution_id, institution_name, created_at, updated_at, "
+            "CASE WHEN cursor IS NOT NULL AND cursor != '' THEN 1 ELSE 0 END AS has_sync_cursor "
+            "FROM plaid_items ORDER BY created_at"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_plaid_item(item_id: str):
+    with conn() as c:
+        c.execute("DELETE FROM plaid_items WHERE item_id = ?", (item_id,))

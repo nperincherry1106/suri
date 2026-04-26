@@ -1,6 +1,9 @@
 """HTTP server for OAuth magic-link flows. Runs in the same process as the
 Telegram bot (see telegram_bot._serve).
 
+Plaid: hosted Link at GET /plaid/link/{session_id}, JSON POST /plaid/exchange,
+and POST /plaid/webhook for Plaid server-to-server (logged; sync optional later).
+
 Two endpoints for Outlook today:
   GET /connect/outlook/{state}        — short link Suri sends to the user.
                                         Looks up the pending flow and redirects
@@ -18,16 +21,19 @@ standard pattern for chat-bot OAuth — one tap, no typed codes, non-blocking,
 gracefully recoverable.
 """
 import asyncio
+import html
 import json
+import os
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app import db
 from app.tools import outlook
+from app.tools import plaid as plaid_tool
 
 app = FastAPI(title="suri-oauth", openapi_url=None, docs_url=None, redoc_url=None)
 
@@ -62,6 +68,10 @@ async def _unhandled(request: Request, exc: Exception):
 _LINK_TTL = timedelta(minutes=15)
 
 
+def _html_escape(s: str) -> str:
+    return html.escape(s, quote=True)
+
+
 def _is_expired(created_at: str | None) -> bool:
     if not created_at:
         return False
@@ -91,6 +101,9 @@ def _page(title: str, body_html: str, status: int = 200) -> HTMLResponse:
   .warn  {{ color: #b45309; }}
   .err   {{ color: #b91c1c; }}
   code   {{ background: #f4f4f5; padding: 0.1rem 0.35rem; border-radius: 0.25rem; }}
+  .tip  {{ background: #f0fdf4; border: 1px solid #86efac; border-radius: 0.4rem; padding: 0.75rem 1rem; font-size: 0.95rem; }}
+  .tip ul {{ margin: 0.4rem 0 0 1rem; padding: 0; }}
+  .tip li {{ margin: 0.35rem 0; }}
 </style>
 </head><body>{body_html}</body></html>"""
     return HTMLResponse(content=html, status_code=status)
@@ -99,6 +112,113 @@ def _page(title: str, body_html: str, status: int = 200) -> HTMLResponse:
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Plaid Link (public browser flow — session id is unguessable, short-lived)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/plaid/link/{session_id}")
+async def plaid_link_page(session_id: str):
+    db.prune_stale_plaid_link_sessions(older_than_minutes=30)
+    row = db.get_plaid_link_session(session_id)
+    if row is None:
+        return _page(
+            "link expired",
+            "<h1>link expired</h1><p>ask suri in telegram for a fresh bank link.</p>",
+            status=404,
+        )
+    if _is_expired(row["created_at"]):
+        db.delete_plaid_link_session(session_id)
+        return _page(
+            "link expired",
+            "<h1>link expired</h1><p>this plaid link is too old. message suri for a new one.</p>",
+            status=410,
+        )
+    token_json = json.dumps(row["link_token"])
+    env = (os.environ.get("PLAID_ENV") or "sandbox").lower().strip() or "sandbox"
+    lines = "".join(
+        f"<li>{_html_escape(t)}</li>" for t in plaid_tool.user_facing_steps()
+    )
+    ro = _html_escape(plaid_tool.read_only_promise())
+    body = f"""<h1>connect your bank (read-only)</h1>
+<p class="ok"><strong>What this does:</strong> {ro}</p>
+<div class="tip"><strong>How to do it ({env})</strong><ul>{lines}</ul></div>
+<p><button type="button" id="plaidBtn" style="font-size:1rem;padding:0.5rem 1rem">open plaid</button></p>
+<p id="status"></p>
+<script id="plaid-link-token" type="application/json">{token_json}</script>
+<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+<script>
+const linkToken = JSON.parse(document.getElementById("plaid-link-token").textContent);
+const btn = document.getElementById("plaidBtn");
+const st = document.getElementById("status");
+if (!window.Plaid) {{
+  st.textContent = "failed to load plaid script. check your network.";
+}} else {{
+  const handler = Plaid.create({{
+    token: linkToken,
+    onSuccess: function(publicToken, meta) {{
+      st.textContent = "finishing up…";
+      fetch("/plaid/exchange", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ public_token: publicToken }})
+      }})
+        .then(r => r.json())
+        .then(d => {{
+          if (d.ok) {{
+            st.innerHTML = "<span class='ok'>connected &mdash; you can close this tab. suri is ready in telegram.</span>";
+            btn.remove();
+          }} else {{
+            st.innerHTML = "<span class='err'>couldn't save link: " + (d.error || "unknown") + "</span>";
+          }}
+        }})
+        .catch(e => {{
+          st.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        }});
+    }},
+    onExit: function() {{
+      st.textContent = "plaid closed without finishing. tap the button to try again.";
+    }},
+    onEvent: function() {{}}
+  }});
+  btn.addEventListener("click", function() {{ handler.open(); }});
+  st.textContent = "tap open plaid to begin.";
+}}
+</script>"""
+    return _page("connect bank", body)
+
+
+@app.post("/plaid/exchange")
+async def plaid_exchange(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="expected JSON")
+    public_token = body.get("public_token") if isinstance(body, dict) else None
+    if not public_token or not isinstance(public_token, str):
+        raise HTTPException(status_code=400, detail="missing public_token")
+    out = await asyncio.to_thread(plaid_tool.exchange_public_token, public_token)
+    if out.get("ok"):
+        print(
+            f"[plaid] item linked item_id={out.get('item_id')}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return JSONResponse(content=out)
+
+
+@app.post("/plaid/webhook")
+async def plaid_webhook(request: Request):
+    """Plaid webhooks: log and return 2xx. Sync-on-webhook can be added later."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {"raw": (await request.body())[:2000].decode("utf-8", errors="replace")}
+    t = body.get("webhook_type") or body.get("type") or "unknown"
+    print(f"[plaid] webhook {t} keys={list(body.keys())[:12]}", file=sys.stderr, flush=True)
+    return {"received": True}
 
 
 # IMPORTANT: keep this registered BEFORE /connect/outlook/{state} or the

@@ -4,6 +4,8 @@ A personal AI assistant that handles small life-logistics tasks through Telegram
 
 This started as an SMS-first subscription canceller (see [`PLAN.md`](./PLAN.md) for the original plan) and pivoted into a Telegram bot with Outlook integration after Twilio compliance wouldn't let me send messages without registering as a business.
 
+**What’s next:** [ROADMAP.md](./ROADMAP.md) (Plaid, full Gmail with confirm-before-send, unified subscription view, iOS when needed).
+
 ## What Suri can actually do today
 
 Verified end-to-end:
@@ -15,6 +17,7 @@ Verified end-to-end:
 - **Find marketing senders + unsubscribe** — scans your inbox for `List-Unsubscribe` headers, then tries three methods in order: RFC 8058 one-click POST → headless-browser confirm-button click (Playwright) → hand the URL back to you.
 - **Block senders + create inbox rules** — `block_sender` is a one-line wrapper around the more general `create_inbox_rule`, which can move/copy/flag/mark-read/delete/forward by sender, subject, body, attachments, importance, etc.
 - **Find paid subscriptions** — scans your inbox for receipts/renewals/invoices to estimate what you're paying for. Detection only; doesn't cancel.
+- **Plaid (optional, read-only)** — you sign in through Plaid’s own bank window; Suri only gets **transaction** data (no moving money). One link session can add **multiple** banks when Plaid offers “add another.” Ask Suri for `plaid_start_link` — the hosted page explains **sandbox** test logins vs production. Configure `PLAID_*` + `SURI_PUBLIC_URL` on the server. See [ROADMAP.md](./ROADMAP.md) Phase 1.
 - **Outlook escape hatch** — `outlook_graph` lets the agent compose any Microsoft Graph call within the granted scopes, so new Outlook capabilities don't always need new code.
 - **Long-term memory** — `remember_fact` / `forget_fact` so you can teach Suri your preferences ("I hate phone calls", "never unsubscribe me from USPS") and they stick across conversations.
 - **Scheduled reminders** — `set_reminder` + APScheduler. Suri proactively pushes the reminder to your Telegram at the right time.

@@ -11,3 +11,4 @@ uvicorn[standard]>=0.32
 # Bundles IANA tz data so APScheduler's CronTrigger(timezone="America/Los_Angeles")
 # works on slim Python images (the Playwright base image doesn't ship tzdata).
 tzdata>=2024.1
+plaid-python>=24.0
