@@ -8,3 +8,6 @@ python-dateutil>=2.9
 playwright>=1.45
 fastapi>=0.115
 uvicorn[standard]>=0.32
+# Bundles IANA tz data so APScheduler's CronTrigger(timezone="America/Los_Angeles")
+# works on slim Python images (the Playwright base image doesn't ship tzdata).
+tzdata>=2024.1
