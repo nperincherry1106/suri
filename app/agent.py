@@ -1,12 +1,13 @@
 import json
 import os
 import sys
+import uuid
 from datetime import datetime
 
 from anthropic import Anthropic
 
 from app import db
-from app.tools import memory, outlook, reminders
+from app.tools import audit, memory, outlook, reminders
 
 MODEL = "claude-sonnet-4-5"
 
@@ -52,7 +53,9 @@ Honesty (HARD RULES, no exceptions):
 3. The "Action ground truth" block in your system prompt is the authoritative
    record of what has actually happened (from the database). If your
    conversation memory disagrees with it, your memory is wrong — defer to
-   ground truth and tell her plainly.
+   ground truth and tell her plainly. For the FULL list of what you did
+   recently (not just the per-tool counts in ground truth), call
+   what_did_you_do.
 4. When summarizing a batch (multiple unsubscribes, multiple deletes),
    enumerate by ground truth, not by recollection: "X succeeded, Y failed
    because [reason]". Never "all done" if anything returned ok:false.
@@ -429,6 +432,33 @@ TOOLS = [
         },
     },
     {
+        "name": "what_did_you_do",
+        "description": (
+            "Look up the actual tool calls Suri made in a recent window. "
+            "Use when Namrita asks 'what did you do today?' / 'what happened "
+            "while I was away?' / 'did you actually unsubscribe X?'.\n\n"
+            "This reads from the audit log (a database table updated every "
+            "time a tool is called), so it's authoritative — prefer it over "
+            "scrolling chat history.\n\n"
+            "After calling, summarize for her in plain English. Group by "
+            "tool when many calls happened. Call out failures (ok:false) "
+            "explicitly — don't bury them."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "since": {
+                    "type": "string",
+                    "description": (
+                        "Window: 'today' | '24h' | 'yesterday' (last 48h) | "
+                        "'7d' | 'week' | '<N>h' (e.g. '6h'). Default '24h'."
+                    ),
+                }
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "set_reminder",
         "description": (
             "Schedule a reminder pushed to Namrita's Telegram at the given "
@@ -514,6 +544,26 @@ def _ground_truth_block() -> str:
     else:
         parts.append("Active scheduled reminders: NONE.")
 
+    # Recent tool calls — collapses to a per-tool count + failures so the
+    # block stays short. For the full payload the agent should call
+    # what_did_you_do.
+    recent = db.recent_agent_actions(hours_back=24, limit=200)
+    if recent:
+        counts: dict[str, int] = {}
+        failures: list[str] = []
+        for a in recent:
+            counts[a["tool_name"]] = counts.get(a["tool_name"], 0) + 1
+            if not a["ok"]:
+                err = a["result"]
+                if isinstance(err, dict):
+                    err = err.get("error") or err.get("note") or "ok:false"
+                failures.append(f"  - {a['tool_name']}: {str(err)[:120]}")
+        summary = ", ".join(f"{k}×{v}" for k, v in sorted(counts.items()))
+        section = f"Recent tool calls (last 24h):\n  {summary}"
+        if failures:
+            section += "\nRecent FAILURES (be honest about these):\n" + "\n".join(failures[:10])
+        parts.append(section)
+
     return "Action ground truth (from database — this is REALITY):\n\n" + "\n\n".join(parts)
 
 
@@ -547,7 +597,7 @@ def _history():
     return msgs
 
 
-def _execute_tool(name: str, input_: dict):
+def _execute_tool(name: str, input_: dict, turn_id: str):
     print(f"[tool] {name}({input_})", file=sys.stderr, flush=True)
     if name == "outlook_graph":
         result = outlook.outlook_graph(
@@ -599,6 +649,8 @@ def _execute_tool(name: str, input_: dict):
         result = reminders.list_reminders()
     elif name == "cancel_reminder":
         result = reminders.cancel_reminder(input_["id"])
+    elif name == "what_did_you_do":
+        result = audit.what_did_you_do(since=input_.get("since", "24h"))
     else:
         result = {"ok": False, "error": f"unknown tool: {name}"}
     # Truncate large results in the log
@@ -608,6 +660,17 @@ def _execute_tool(name: str, input_: dict):
         s = str(result)
         log_view = s if len(s) <= 300 else s[:300] + "...[truncated]"
     print(f"[tool] -> {log_view}", file=sys.stderr, flush=True)
+    # Persist for ground-truth + what_did_you_do. ok:false dicts are still
+    # logged — failures are part of the audit trail. Skip self-logging
+    # what_did_you_do calls so the tool's own queries don't pollute results.
+    if name != "what_did_you_do":
+        ok = True
+        if isinstance(result, dict) and result.get("ok") is False:
+            ok = False
+        try:
+            db.log_agent_action(turn_id, name, input_, result, ok)
+        except Exception as e:
+            print(f"[audit] log failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
     return result
 
 
@@ -629,6 +692,9 @@ def handle(send=None) -> list[str]:
     returns the full list of messages sent."""
     messages = _history()
     sent: list[str] = []
+    # One turn_id per user message → spans every tool call in this loop.
+    # Lets the audit log group "what happened in response to that ask".
+    turn_id = uuid.uuid4().hex[:12]
     while True:
         resp = _get_client().messages.create(
             model=MODEL,
@@ -652,9 +718,13 @@ def handle(send=None) -> list[str]:
             if block.type != "tool_use":
                 continue
             try:
-                result = _execute_tool(block.name, block.input)
+                result = _execute_tool(block.name, block.input, turn_id)
             except Exception as e:
                 result = {"error": f"{type(e).__name__}: {e}"}
+                try:
+                    db.log_agent_action(turn_id, block.name, block.input, result, False)
+                except Exception as log_e:
+                    print(f"[audit] log failed: {type(log_e).__name__}: {log_e}", file=sys.stderr, flush=True)
             tool_results.append(
                 {
                     "type": "tool_result",
