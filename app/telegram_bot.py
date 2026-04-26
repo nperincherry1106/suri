@@ -263,7 +263,10 @@ async def _serve(application: Application):
             host="0.0.0.0",
             port=port,
             log_level="info",
-            access_log=False,
+            # Keep access logs ON. The OAuth callback path is rare (≤ daily)
+            # and being able to see "did Microsoft's redirect actually reach us"
+            # in the logs is worth the noise.
+            access_log=True,
         )
         server = uvicorn.Server(config)
         print(f"[oauth] serving on 0.0.0.0:{port}", file=sys.stderr, flush=True)

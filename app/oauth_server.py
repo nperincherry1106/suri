@@ -20,6 +20,7 @@ gracefully recoverable.
 import asyncio
 import json
 import sys
+import traceback
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
@@ -29,6 +30,32 @@ from app import db
 from app.tools import outlook
 
 app = FastAPI(title="suri-oauth", openapi_url=None, docs_url=None, redoc_url=None)
+
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    """Last-resort handler so a route bug renders a useful page instead of
+    starlette's bare 'Internal Server Error', AND dumps a traceback to stderr
+    so we can actually debug from `fly logs`."""
+    tb = traceback.format_exc()
+    print(
+        f"[oauth] unhandled {type(exc).__name__} on {request.method} "
+        f"{request.url.path}: {exc}\n{tb}",
+        file=sys.stderr,
+        flush=True,
+    )
+    body = (
+        "<h1 class='err'>something went wrong</h1>"
+        f"<p><code>{type(exc).__name__}: {exc}</code></p>"
+        "<p>head back to telegram and try the connect link again. "
+        "if it keeps failing, mention this to suri.</p>"
+    )
+    # Hand-rendered because _page is defined below this handler.
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>error</title>
+<style>body{{font-family:-apple-system,sans-serif;max-width:28rem;margin:4rem auto;padding:0 1.5rem;color:#222;line-height:1.5}}h1{{font-size:1.4rem}}.err{{color:#b91c1c}}code{{background:#f4f4f5;padding:.1rem .35rem;border-radius:.25rem}}</style>
+</head><body>{body}</body></html>"""
+    return HTMLResponse(content=html, status_code=500)
 
 # How long a pending OAuth row stays valid. Microsoft's auth-code itself
 # is good for ~10 min; we give the user a bit longer to tap the magic link.
