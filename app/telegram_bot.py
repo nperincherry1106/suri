@@ -16,7 +16,8 @@ _app: Application | None = None
 _loop: asyncio.AbstractEventLoop | None = None
 # Serialize agent turns so two near-simultaneous messages don't both load the
 # same _history() and replay each other's input. Single-user app, so one
-# global lock is sufficient.
+# global lock is sufficient. The OAuth callback also acquires this when
+# re-running the original prompt after auth completes.
 _turn_lock: asyncio.Lock | None = None
 
 
@@ -38,20 +39,51 @@ _MD_BULLET_RE = re.compile(r"^(\s*)[*+]\s+", re.MULTILINE)
 def strip_markdown(text: str) -> str:
     """Remove markdown syntax that Telegram doesn't render, leaving readable
     plain text. Conservative — only strips formatting marks, never content."""
-    # links: "[label](url)" -> "label (url)"
     text = _MD_LINK_RE.sub(r"\1 (\2)", text)
-    # ATX headers: "# Foo" -> "Foo"
     text = _MD_HEADER_RE.sub("", text)
-    # fenced code blocks: drop the fences, keep the content
     text = _MD_FENCED_CODE_RE.sub("", text)
-    # inline code: "`foo`" -> "foo"
     text = _MD_INLINE_CODE_RE.sub(r"\1", text)
-    # markdown bullets ("* item" / "+ item") -> "- item" (keep the indent)
-    # Run BEFORE bold/italic so a leading "*" isn't mistaken for italic.
     text = _MD_BULLET_RE.sub(r"\1- ", text)
-    # bold/italic/bold-italic with * or _: "**foo**" / "_foo_" / "***foo***" -> "foo"
     text = _MD_BOLD_ITALIC_RE.sub(r"\2", text)
     return text
+
+
+def _emitter(chat_id: int, loop: asyncio.AbstractEventLoop):
+    """Build an emit callback the agent can invoke from a worker thread."""
+    if _app is None:
+        raise RuntimeError("telegram bot not initialized")
+    bot = _app.bot
+
+    def emit(reply: str):
+        clean = strip_markdown(reply)
+        db.log_outbound(clean)
+        asyncio.run_coroutine_threadsafe(
+            bot.send_message(chat_id=chat_id, text=clean), loop
+        )
+
+    return emit
+
+
+async def run_turn(text: str, chat_id: int | None = None) -> None:
+    """Run one agent turn for `text` as if the user just sent it. Logs the
+    inbound, takes the per-turn lock, runs the agent on a worker thread, and
+    emits each agent reply back to Telegram. Used by both the inbound message
+    handler and the OAuth callback (to replay the original prompt after auth)."""
+    if _turn_lock is None or _loop is None or _app is None:
+        raise RuntimeError("telegram bot not initialized")
+    if chat_id is None:
+        chat_id = _allowed_user_id()
+
+    async with _turn_lock:
+        db.log_inbound(text)
+        emit = _emitter(chat_id, _loop)
+        try:
+            await asyncio.to_thread(agent.handle, emit)
+        except Exception as e:
+            print(f"[telegram] agent error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            await _app.bot.send_message(
+                chat_id=chat_id, text=f"[error: {type(e).__name__}: {e}]"
+            )
 
 
 async def _on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -68,29 +100,10 @@ async def _on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     bot = context.bot
-    loop = asyncio.get_running_loop()
     # TYPING outside the lock so the user sees activity even if a previous
     # turn is still running.
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    def emit(reply: str):
-        clean = strip_markdown(reply)
-        db.log_outbound(clean)
-        asyncio.run_coroutine_threadsafe(
-            bot.send_message(chat_id=chat_id, text=clean), loop
-        )
-
-    if _turn_lock is None:
-        raise RuntimeError("telegram bot not initialized: _turn_lock is None")
-    async with _turn_lock:
-        # Log inbound INSIDE the lock so the previous turn's _history() read
-        # has already completed before this message becomes visible to it.
-        db.log_inbound(text)
-        try:
-            await asyncio.to_thread(agent.handle, emit)
-        except Exception as e:
-            print(f"[telegram] agent error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-            await bot.send_message(chat_id=chat_id, text=f"[error: {type(e).__name__}: {e}]")
+    await run_turn(text, chat_id=chat_id)
 
 
 async def push(text: str):
@@ -119,21 +132,72 @@ def push_threadsafe(text: str):
         raise RuntimeError(f"push send failed: {type(e).__name__}: {e}") from e
 
 
-async def _post_init(application: Application):
+def schedule_on_loop(coro):
+    """Schedule a coroutine on the bot's event loop from any thread.
+    Returns a concurrent.futures.Future."""
+    if _loop is None:
+        raise RuntimeError("telegram bot not initialized: _loop is None")
+    return asyncio.run_coroutine_threadsafe(coro, _loop)
+
+
+async def _serve(application: Application):
+    """Run the Telegram polling AND the OAuth HTTP server on the same event
+    loop. Either coroutine returning ends the process (uvicorn.serve() blocks
+    forever in normal operation; if it crashes we want the supervisor to
+    restart us)."""
     global _loop, _turn_lock
     _loop = asyncio.get_running_loop()
     _turn_lock = asyncio.Lock()
-    # Register us as the global push transport. Anyone (scheduler firing a
-    # reminder, outlook prompting for device-code re-auth, etc.) calls
-    # push.push() and it lands in telegram.
     push_module.set_callback(push_threadsafe)
-    # Now that the push channel is live, restore any pending reminders.
     scheduler.restore_pending()
+
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     print(
-        f"[telegram] ready. allowlisted user_id={_allowed_user_id()}",
+        f"[telegram] polling started. allowlisted user_id={_allowed_user_id()}",
         file=sys.stderr,
         flush=True,
     )
+
+    # Start the OAuth callback server only if a public URL is configured.
+    # Local CLI dev / no-domain deploys keep the device-code fallback and
+    # don't need an HTTP listener.
+    if os.environ.get("SURI_PUBLIC_URL"):
+        # Imported lazily so dev environments without uvicorn/fastapi still
+        # work for the device-code path.
+        from app import oauth_server
+        import uvicorn
+
+        port = int(os.environ.get("PORT", "8080"))
+        config = uvicorn.Config(
+            oauth_server.app,
+            host="0.0.0.0",
+            port=port,
+            log_level="info",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        print(f"[oauth] serving on 0.0.0.0:{port}", file=sys.stderr, flush=True)
+        try:
+            await server.serve()
+        finally:
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+    else:
+        print(
+            "[oauth] SURI_PUBLIC_URL not set — falling back to device-code "
+            "for Outlook auth. polling forever.",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            await asyncio.Event().wait()  # block forever
+        finally:
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
 
 
 def main():
@@ -149,12 +213,12 @@ def main():
         print("error: TELEGRAM_USER_ID not set in .env", file=sys.stderr)
         sys.exit(1)
 
-    _app = Application.builder().token(token).post_init(_post_init).build()
+    _app = Application.builder().token(token).build()
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_message))
 
-    print("[telegram] starting polling...", file=sys.stderr, flush=True)
+    print("[telegram] starting...", file=sys.stderr, flush=True)
     try:
-        _app.run_polling(allowed_updates=Update.ALL_TYPES)
+        asyncio.run(_serve(_app))
     finally:
         scheduler.shutdown()
 

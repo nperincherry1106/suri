@@ -30,74 +30,215 @@ _DATA_DIR = Path(os.environ.get("SURI_DATA_DIR", ROOT))
 TOKEN_PATH = _DATA_DIR / "outlook_token.json"
 
 
-def _token() -> str:
-    cache = msal.SerializableTokenCache()
-    if TOKEN_PATH.exists():
-        cache.deserialize(TOKEN_PATH.read_text())
+class OutlookAuthRequired(Exception):
+    """Raised by _token() when there's no cached token and we've handed the
+    user a magic link to complete OAuth. The agent loop catches this and
+    bails out cleanly — the OAuth callback will re-trigger the original
+    prompt once auth completes."""
 
+    def __init__(self, state: str, auth_url: str):
+        super().__init__(f"outlook auth required (state={state})")
+        self.state = state
+        self.auth_url = auth_url
+
+
+def _msal_app(cache: msal.SerializableTokenCache) -> msal.PublicClientApplication:
     client_id = os.environ.get("MS_CLIENT_ID")
     if not client_id:
         raise RuntimeError(
             "missing MS_CLIENT_ID in .env. register an Azure app and put the "
             "Application (client) ID there."
         )
-
-    app = msal.PublicClientApplication(
+    return msal.PublicClientApplication(
         client_id, authority=AUTHORITY, token_cache=cache
     )
 
-    result = None
-    accounts = app.get_accounts()
-    if accounts:
-        result = app.acquire_token_silent(SCOPES, account=accounts[0])
 
-    if not result:
-        # On a headless server (no display, no browser) the interactive flow
-        # would crash trying to open a browser tab. Use device-code flow
-        # instead: print a URL + short code to stderr, user opens it on their
-        # phone/laptop and enters the code. Token then persists to the volume
-        # so this only happens on first deploy + every ~90 days when refresh
-        # tokens expire.
-        if os.environ.get("SURI_HEADLESS") == "1":
-            flow = app.initiate_device_flow(scopes=SCOPES)
-            if "user_code" not in flow:
-                raise RuntimeError(
-                    f"failed to start MS device-code flow: {flow}"
-                )
-            user_code = flow["user_code"]
-            verify_url = flow.get(
-                "verification_uri", "https://www.microsoft.com/link"
-            )
-            # Log to stderr (visible via `fly logs`) AND push to telegram so
-            # she sees it on her phone without needing to tail logs.
-            stderr_msg = (
-                "\n=== OUTLOOK AUTH REQUIRED ===\n"
-                f"{flow['message']}\n"
-                "Suri is now blocked until you complete this. "
-                "After auth, the token is cached to the persistent volume.\n"
-            )
-            print(stderr_msg, file=sys.stderr, flush=True)
-            push.push(
-                "Outlook needs me to re-authenticate before I can do that.\n\n"
-                f"Open this link: {verify_url}\n"
-                f"Enter this code: {user_code}\n\n"
-                "Sign in with your Microsoft account. I'll keep waiting "
-                "(this prompt is good for ~15 min). Once you're done I'll "
-                "answer your original message."
-            )
-            result = app.acquire_token_by_device_flow(flow)
-        else:
-            result = app.acquire_token_interactive(SCOPES)
+def _load_cache() -> msal.SerializableTokenCache:
+    cache = msal.SerializableTokenCache()
+    if TOKEN_PATH.exists():
+        cache.deserialize(TOKEN_PATH.read_text())
+    return cache
 
+
+def _persist_cache(cache: msal.SerializableTokenCache) -> None:
     if cache.has_state_changed:
         TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
         TOKEN_PATH.write_text(cache.serialize())
 
+
+def _redirect_uri() -> str | None:
+    """Public callback URL for the auth-code flow. None means we don't have
+    a public HTTPS endpoint and have to fall back to device-code."""
+    explicit = os.environ.get("MS_REDIRECT_URI")
+    if explicit:
+        return explicit
+    base = os.environ.get("SURI_PUBLIC_URL")
+    if not base:
+        return None
+    return base.rstrip("/") + "/connect/outlook/callback"
+
+
+def _start_magic_link_flow(app: msal.PublicClientApplication, redirect_uri: str) -> None:
+    """Initiate the auth-code flow, persist its state to the DB, and push a
+    one-tap magic link to the user. Then raise OutlookAuthRequired so the
+    agent loop bails out — the OAuth callback will re-run the original
+    prompt once auth completes."""
+    flow = app.initiate_auth_code_flow(scopes=SCOPES, redirect_uri=redirect_uri)
+    if "auth_uri" not in flow or "state" not in flow:
+        raise RuntimeError(f"failed to initiate MS auth-code flow: {flow}")
+
+    # Pull the user's most recent inbound as the prompt to replay after auth.
+    # Single-user app + _turn_lock guarantees this is the message that
+    # triggered the current tool call.
+    recent = db.recent_messages(1)
+    original_prompt = recent[0][1] if recent and recent[0][0] == "inbound" else None
+
+    telegram_user_id_str = os.environ.get("TELEGRAM_USER_ID")
+    if not telegram_user_id_str:
+        raise RuntimeError("missing TELEGRAM_USER_ID — can't route OAuth callback")
+
+    db.create_pending_oauth(
+        state=flow["state"],
+        provider="outlook",
+        flow_json=json.dumps(flow),
+        telegram_user_id=int(telegram_user_id_str),
+        original_prompt=original_prompt,
+    )
+
+    base = (os.environ.get("SURI_PUBLIC_URL") or "").rstrip("/")
+    short_link = f"{base}/connect/outlook/{flow['state']}" if base else flow["auth_uri"]
+
+    push.push(
+        "first time on email — i need your microsoft sign-in to read your inbox.\n\n"
+        f"tap to connect: {short_link}\n\n"
+        "one tap, ~30 seconds. i can read mail and save drafts — i never send "
+        "as you. once you're done i'll pick up where we left off."
+    )
+    print(
+        f"[outlook-auth] magic link issued, state={flow['state']}",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise OutlookAuthRequired(state=flow["state"], auth_url=short_link)
+
+
+def _start_device_code_flow(app: msal.PublicClientApplication) -> dict:
+    """Fallback when no public URL is configured. Blocks the worker thread
+    for up to ~15 min while the user enters the code on microsoft.com/link."""
+    flow = app.initiate_device_flow(scopes=SCOPES)
+    if "user_code" not in flow:
+        raise RuntimeError(f"failed to start MS device-code flow: {flow}")
+    user_code = flow["user_code"]
+    verify_url = flow.get("verification_uri", "https://www.microsoft.com/link")
+    print(
+        "\n=== OUTLOOK AUTH REQUIRED ===\n"
+        f"{flow['message']}\n"
+        "Suri is blocked until this completes.\n",
+        file=sys.stderr,
+        flush=True,
+    )
+    push.push(
+        "outlook needs you to sign in before i can do that.\n\n"
+        # microsoft.com/link?otc=CODE pre-fills the code on the consent screen,
+        # saving a copy/paste step.
+        f"tap: {verify_url}?otc={user_code}\n"
+        f"(or open {verify_url} and enter code: {user_code})\n\n"
+        "i'll keep waiting (~15 min). once you're done i'll answer your message."
+    )
+    return app.acquire_token_by_device_flow(flow)
+
+
+def _token() -> str:
+    """Get a valid Outlook access token, prompting the user to auth if needed.
+
+    Three modes, picked automatically:
+      1. Silent: refresh token cached → just refresh.
+      2. Magic link: SURI_HEADLESS=1 + SURI_PUBLIC_URL set → push one-tap
+         link, raise OutlookAuthRequired. Agent loop bails; OAuth callback
+         re-runs the original prompt once consent completes.
+      3. Device code: SURI_HEADLESS=1 with no public URL → blocking fallback.
+      4. Interactive: not headless (local dev) → MSAL pops a browser.
+    """
+    cache = _load_cache()
+    app = _msal_app(cache)
+
+    accounts = app.get_accounts()
+    if accounts:
+        result = app.acquire_token_silent(SCOPES, account=accounts[0])
+        if result:
+            _persist_cache(cache)
+            if "access_token" not in result:
+                raise RuntimeError(
+                    f"outlook auth failed: {result.get('error_description', result)}"
+                )
+            return result["access_token"]
+
+    if os.environ.get("SURI_HEADLESS") == "1":
+        redirect_uri = _redirect_uri()
+        if redirect_uri:
+            _start_magic_link_flow(app, redirect_uri)  # raises OutlookAuthRequired
+        result = _start_device_code_flow(app)
+    else:
+        result = app.acquire_token_interactive(SCOPES)
+
+    _persist_cache(cache)
     if "access_token" not in result:
         raise RuntimeError(
             f"outlook auth failed: {result.get('error_description', result)}"
         )
     return result["access_token"]
+
+
+def complete_auth_code_flow(flow: dict, auth_response: dict) -> dict:
+    """Called by the OAuth callback to exchange the authorization code for
+    an access token. Persists the token cache to disk on success.
+
+    Returns MSAL's result dict. Caller should check for 'access_token'."""
+    cache = _load_cache()
+    app = _msal_app(cache)
+    result = app.acquire_token_by_auth_code_flow(flow, auth_response)
+    _persist_cache(cache)
+    return result
+
+
+def _read_cache_accounts() -> list[dict]:
+    """Read the MSAL serialized cache file directly and return its Account
+    entries. No MSAL instantiation — that triggers an AAD discovery HTTP
+    call on construction, which we don't want in the system-prompt path
+    (every agent turn would do a network round-trip just to render the
+    'connected accounts' block).
+
+    The cache schema is the standard MSAL serialized format:
+      { "Account": { "<key>": { "username": ..., ... }, ... }, ... }
+    Stable across MSAL versions per their on-disk contract."""
+    if not TOKEN_PATH.exists():
+        return []
+    try:
+        data = json.loads(TOKEN_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    accounts = data.get("Account", {})
+    if not isinstance(accounts, dict):
+        return []
+    return [v for v in accounts.values() if isinstance(v, dict)]
+
+
+def has_valid_token() -> bool:
+    """True if the cache file has at least one Account entry. No network
+    call. We're checking presence of credentials, not whether they still
+    refresh — if they don't, the next tool call surfaces the magic-link
+    flow. That keeps the system-prompt path zero-cost."""
+    return len(_read_cache_accounts()) > 0
+
+
+def cached_account_email() -> str | None:
+    """Username/UPN on the cached Outlook account, if any. No network call.
+    Used by the 'connected accounts' status block."""
+    accts = _read_cache_accounts()
+    if not accts:
+        return None
+    return accts[0].get("username")
 
 
 def _extract_unsubscribe(headers_list):

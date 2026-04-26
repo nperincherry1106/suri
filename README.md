@@ -85,15 +85,21 @@ cp .env.example .env
 1. https://portal.azure.com → Microsoft Entra ID → App registrations → New registration.
 2. **Name**: anything (e.g. "Suri").
 3. **Supported account types**: "Personal Microsoft accounts only" (or both, if you have a work account too).
-4. **Redirect URI**: Public client/native → `http://localhost`.
+4. **Redirect URI**: Public client/native → `http://localhost`. (Used for local dev / device-code fallback.)
 5. After creating, open the app → **Manifest** → set `"accessTokenAcceptedVersion": 2` (instead of `null`).
-6. Open **API permissions** → Add a permission → Microsoft Graph → Delegated → check:
+6. **For deployed Suri (recommended)** — Authentication tab → Add a platform → "Mobile and desktop applications" → add `https://<your-app>.fly.dev/connect/outlook/callback`. This is the magic-link callback. Set `SURI_PUBLIC_URL=https://<your-app>.fly.dev` in your env so Suri builds the right link. Without this, deployed Suri falls back to device-code (typed 9-char codes — works, but worse UX).
+7. Open **API permissions** → Add a permission → Microsoft Graph → Delegated → check:
    - `Mail.ReadWrite`
    - `MailboxSettings.ReadWrite` (required for inbox rules)
-7. Grant admin consent (or just consent on first auth).
-8. Copy the **Application (client) ID** into `MS_CLIENT_ID` in `.env`.
+8. Grant admin consent (or just consent on first auth).
+9. Copy the **Application (client) ID** into `MS_CLIENT_ID` in `.env`.
 
-The first time Suri makes an Outlook call, MSAL will pop a browser tab for you to authorize. After that, the token cache (`outlook_token.json`) persists.
+**First-time auth flow:**
+- **Local dev** (`SURI_HEADLESS` unset): MSAL pops a browser tab on the first Outlook call.
+- **Deployed with `SURI_PUBLIC_URL`**: Suri sends a one-tap magic link in Telegram. You sign in with Microsoft, then come back to the chat — Suri auto-resumes your original message.
+- **Deployed without `SURI_PUBLIC_URL`**: device-code fallback. Suri sends a microsoft.com/link URL plus a code; you sign in there.
+
+After auth, the token cache (`outlook_token.json`) persists to the data volume — refreshes silently for ~90 days.
 
 ## Run
 
@@ -115,6 +121,7 @@ python -m app.cli
 app/
   agent.py           # persona, tools list, agent loop with Claude
   telegram_bot.py    # Telegram transport, markdown stripper, push channel
+  oauth_server.py    # FastAPI server for OAuth magic-link callbacks
   cli.py             # terminal REPL for dev
   scheduler.py       # APScheduler wrapper, push callback registration
   db.py              # SQLite schema + helpers
@@ -143,7 +150,6 @@ The `unsubscribe_from` tool is also explicitly honest about uncertainty: it dist
 
 This is a personal weekend project, not a production system. If you want to fork it as a starting point or send a PR with an improvement, go for it. Things that would be especially useful:
 
-- **Cloud deployment** — Dockerfile + fly.io config, plus switching MSAL to device-code flow so Outlook auth works on a headless server.
 - **Calendar tools** — `Calendars.ReadWrite` scope plus list/find/create/cancel events.
 - **Skills system** — Anthropic-style markdown-skills the agent can read on-demand and (carefully) author. Was scoped but punted as too much complexity for now.
 - **Subscription cancellation** — the original v0 goal. Per-service Playwright flows for Netflix, Spotify, NYT, etc.

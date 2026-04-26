@@ -1,11 +1,13 @@
 # fly.toml — Suri deployment config.
 #
 # Notes:
-#   - No [http_service]: Suri doesn't accept inbound HTTP. The Telegram bot
-#     polls outbound, so we don't need a public listener.
+#   - [http_service] exposes the OAuth callback server on https://<app>.fly.dev.
+#     Used for the magic-link Outlook auth flow (see app/oauth_server.py).
+#     The Telegram bot still polls outbound — HTTP is only for OAuth redirects.
 #   - Single machine, no auto-stop: the Telegram long-poll connection can only
 #     have ONE active client per bot token. Two machines polling the same bot
-#     would produce 409 Conflicts every few seconds.
+#     would produce 409 Conflicts every few seconds. Also, in-flight OAuth
+#     flows have state in SQLite — a second machine wouldn't see them.
 #   - 1GB RAM: Chromium (used for unsubscribe pages) needs the headroom.
 #   - Volume at /data: SQLite db + outlook_token.json persist across deploys.
 #
@@ -20,6 +22,19 @@ primary_region = "sjc"  # San Jose — closest US west coast region to PT
   SURI_HEADLESS = "1"
   SURI_DATA_DIR = "/data"
   TZ = "America/Los_Angeles"
+  PORT = "8080"
+  # Public URL Suri uses to build OAuth magic links. Must match the redirect
+  # URI registered in the Azure app: <SURI_PUBLIC_URL>/connect/outlook/callback
+  SURI_PUBLIC_URL = "https://suri.fly.dev"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # auto_stop disabled: bot polls Telegram + holds in-memory state we don't
+  # want torn down between requests.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
 
 [mounts]
   source = "suri_data"

@@ -5,8 +5,9 @@ from datetime import datetime
 
 from anthropic import Anthropic
 
-from app import db
+from app import accounts, db
 from app.tools import memory, outlook, reminders
+from app.tools.outlook import OutlookAuthRequired
 
 MODEL = "claude-sonnet-4-5"
 
@@ -53,10 +54,18 @@ Honesty (HARD RULES, no exceptions):
    record of what has actually happened (from the database). If your
    conversation memory disagrees with it, your memory is wrong — defer to
    ground truth and tell her plainly.
-4. When summarizing a batch (multiple unsubscribes, multiple deletes),
+4. The "Connected accounts" block tells you which integrations she has
+   actually authorized. BEFORE you say "let me check your inbox" / "I'll
+   look at your calendar" / etc., verify the relevant provider is listed.
+   If it's not, don't pretend — say "I don't have access to that yet, want
+   to connect it?" and the next tool call will trigger the one-tap connect
+   flow. Never call a provider tool just to "see what happens" if the
+   account block shows it's not connected — you'll trigger an unnecessary
+   auth prompt.
+5. When summarizing a batch (multiple unsubscribes, multiple deletes),
    enumerate by ground truth, not by recollection: "X succeeded, Y failed
    because [reason]". Never "all done" if anything returned ok:false.
-5. The tool descriptions in your tool list tell you HOW to use each tool
+6. The tool descriptions in your tool list tell you HOW to use each tool
    (workflow, ordering, gates). Follow them."""
 
 TOOLS = [
@@ -521,8 +530,9 @@ def _system_prompt() -> str:
     now = datetime.now().astimezone()
     time_block = f"Current time: {now.isoformat(timespec='seconds')} ({now.tzname()})"
     truth_block = _ground_truth_block()
+    accounts_block = accounts.status_block()
     facts = db.user_facts()
-    sections = [PERSONA, time_block, truth_block]
+    sections = [PERSONA, time_block, truth_block, accounts_block]
     if facts:
         facts_block = "Known about the user:\n" + "\n".join(
             f"- {k}: {v}" for k, v in facts.items()
@@ -653,6 +663,18 @@ def handle(send=None) -> list[str]:
                 continue
             try:
                 result = _execute_tool(block.name, block.input)
+            except OutlookAuthRequired as e:
+                # _token() already pushed the magic link to the user. Bail out
+                # of the agent loop entirely — the OAuth callback will replay
+                # the original prompt once consent completes. Don't feed an
+                # error back to Claude; we don't want a half-answer.
+                print(
+                    f"[agent] outlook auth required (state={e.state}); "
+                    "bailing until callback fires.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return sent
             except Exception as e:
                 result = {"error": f"{type(e).__name__}: {e}"}
             tool_results.append(

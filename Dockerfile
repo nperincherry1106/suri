@@ -21,4 +21,8 @@ COPY app/ ./app/
 RUN mkdir -p /data
 VOLUME ["/data"]
 
+# OAuth callback server (see app/oauth_server.py); fly's edge proxy terminates
+# TLS and forwards :443 -> :8080. Set PORT to override.
+EXPOSE 8080
+
 CMD ["python", "-m", "app.telegram_bot"]

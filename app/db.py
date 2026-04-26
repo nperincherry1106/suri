@@ -81,6 +81,14 @@ def init():
                 sample_subject TEXT,
                 last_seen DATETIME
             );
+            CREATE TABLE IF NOT EXISTS pending_oauth (
+                state TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                flow_json TEXT NOT NULL,
+                telegram_user_id INTEGER NOT NULL,
+                original_prompt TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
 
@@ -383,3 +391,51 @@ def list_paid_subscriptions():
             "FROM paid_subscriptions ORDER BY last_charge_date DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def create_pending_oauth(
+    state: str,
+    provider: str,
+    flow_json: str,
+    telegram_user_id: int,
+    original_prompt: str | None,
+):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO pending_oauth (state, provider, flow_json, telegram_user_id, original_prompt) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (state, provider, flow_json, telegram_user_id, original_prompt),
+        )
+
+
+def get_pending_oauth(state: str):
+    with conn() as c:
+        row = c.execute(
+            "SELECT state, provider, flow_json, telegram_user_id, original_prompt, created_at "
+            "FROM pending_oauth WHERE state = ?",
+            (state,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "state": row["state"],
+        "provider": row["provider"],
+        "flow_json": row["flow_json"],
+        "telegram_user_id": row["telegram_user_id"],
+        "original_prompt": row["original_prompt"],
+        "created_at": row["created_at"],
+    }
+
+
+def delete_pending_oauth(state: str):
+    with conn() as c:
+        c.execute("DELETE FROM pending_oauth WHERE state = ?", (state,))
+
+
+def prune_expired_oauth(older_than_minutes: int = 60):
+    with conn() as c:
+        c.execute(
+            "DELETE FROM pending_oauth "
+            "WHERE created_at < datetime('now', ?)",
+            (f"-{older_than_minutes} minutes",),
+        )
