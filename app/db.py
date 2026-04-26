@@ -13,7 +13,7 @@ DB_PATH = _DATA_DIR / "sai.db"
 
 @contextmanager
 def conn():
-    DB_PATH.parent.mkdir(exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     try:
@@ -318,6 +318,14 @@ def mark_reminder_fired(reminder_id: int):
     with conn() as c:
         c.execute(
             "UPDATE reminders SET status = 'fired', fired_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (reminder_id,),
+        )
+
+
+def mark_reminder_failed(reminder_id: int):
+    with conn() as c:
+        c.execute(
+            "UPDATE reminders SET status = 'failed', fired_at = CURRENT_TIMESTAMP WHERE id = ?",
             (reminder_id,),
         )
 

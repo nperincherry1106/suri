@@ -82,12 +82,16 @@ def _fire(reminder_id: int, body: str):
     registered."""
     msg = f"reminder: {body}"
     print(f"[scheduler] firing reminder #{reminder_id}", file=sys.stderr, flush=True)
-    if not push.push(msg):
-        print(f"\n[reminder fired - stdout fallback] {msg}", flush=True)
-    else:
+    if push.push(msg):
         print(
             f"[scheduler] reminder #{reminder_id} delivered",
             file=sys.stderr,
             flush=True,
         )
-    db.mark_reminder_fired(reminder_id)
+        db.mark_reminder_fired(reminder_id)
+    else:
+        # No transport / callback raised. Fall back to stdout so CLI dev still
+        # sees it, then mark failed instead of fired so we don't silently lose
+        # the reminder. Recoverable manually via a future re-run / requeue.
+        print(f"\n[reminder fired - stdout fallback] {msg}", flush=True)
+        db.mark_reminder_failed(reminder_id)

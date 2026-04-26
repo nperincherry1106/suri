@@ -539,6 +539,11 @@ def _history():
             msgs[-1]["content"] += "\n\n" + b
         else:
             msgs.append({"role": role, "content": b})
+    # Anthropic requires the first message to be role=user. A pushed reminder
+    # logged via db.log_outbound can otherwise end up as the first item in
+    # the rolling 20-message window — drop leading assistant entries.
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
     return msgs
 
 

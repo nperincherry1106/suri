@@ -14,6 +14,10 @@ from app import scheduler
 
 _app: Application | None = None
 _loop: asyncio.AbstractEventLoop | None = None
+# Serialize agent turns so two near-simultaneous messages don't both load the
+# same _history() and replay each other's input. Single-user app, so one
+# global lock is sufficient.
+_turn_lock: asyncio.Lock | None = None
 
 
 def _allowed_user_id() -> int:
@@ -62,11 +66,11 @@ async def _on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    db.log_inbound(text)
-
     chat_id = update.effective_chat.id
     bot = context.bot
     loop = asyncio.get_running_loop()
+    # TYPING outside the lock so the user sees activity even if a previous
+    # turn is still running.
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     def emit(reply: str):
@@ -76,11 +80,17 @@ async def _on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot.send_message(chat_id=chat_id, text=clean), loop
         )
 
-    try:
-        await asyncio.to_thread(agent.handle, emit)
-    except Exception as e:
-        print(f"[telegram] agent error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        await bot.send_message(chat_id=chat_id, text=f"[error: {type(e).__name__}: {e}]")
+    if _turn_lock is None:
+        raise RuntimeError("telegram bot not initialized: _turn_lock is None")
+    async with _turn_lock:
+        # Log inbound INSIDE the lock so the previous turn's _history() read
+        # has already completed before this message becomes visible to it.
+        db.log_inbound(text)
+        try:
+            await asyncio.to_thread(agent.handle, emit)
+        except Exception as e:
+            print(f"[telegram] agent error: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            await bot.send_message(chat_id=chat_id, text=f"[error: {type(e).__name__}: {e}]")
 
 
 async def push(text: str):
@@ -110,8 +120,9 @@ def push_threadsafe(text: str):
 
 
 async def _post_init(application: Application):
-    global _loop
+    global _loop, _turn_lock
     _loop = asyncio.get_running_loop()
+    _turn_lock = asyncio.Lock()
     # Register us as the global push transport. Anyone (scheduler firing a
     # reminder, outlook prompting for device-code re-auth, etc.) calls
     # push.push() and it lands in telegram.

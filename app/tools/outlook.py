@@ -540,11 +540,13 @@ def _resolve_folder_id(token: str, folder: str) -> tuple[str | None, str | None]
             return None, f"lookup well-known folder '{folder_lc}' failed ({r.status_code}): {r.text[:200]}"
         return r.json().get("id"), None
 
-    # Otherwise, try to find a folder by displayName
+    # Otherwise, try to find a folder by displayName.
+    # OData escapes ' by doubling — required for folder names like "Mary's Stuff".
+    folder_escaped = folder_norm.replace("'", "''")
     r = requests.get(
         f"{GRAPH}/me/mailFolders",
         headers=headers,
-        params={"$filter": f"displayName eq '{folder_norm}'", "$top": "5"},
+        params={"$filter": f"displayName eq '{folder_escaped}'", "$top": "5"},
         timeout=15,
     )
     if r.status_code >= 400:
@@ -553,6 +555,12 @@ def _resolve_folder_id(token: str, folder: str) -> tuple[str | None, str | None]
     if not matches:
         return None, f"no folder named '{folder_norm}' found"
     return matches[0].get("id"), None
+
+
+def _looks_like_folder_id(v: str) -> bool:
+    """Graph folder IDs are long base64-ish blobs ending in '='. Heuristic only;
+    used as a fallback when name resolution finds nothing."""
+    return len(v) >= 60 and "=" in v
 
 
 def _normalize_rule_actions(token: str, actions: dict) -> tuple[dict, str | None]:
@@ -565,15 +573,17 @@ def _normalize_rule_actions(token: str, actions: dict) -> tuple[dict, str | None
         if k in ("moveToFolder", "copyToFolder"):
             if not isinstance(v, str):
                 return {}, f"{k} must be a string (folder name or id)"
-            # If it doesn't look like a Graph ID (long base64-ish), treat as
-            # a name and resolve.
-            if len(v) < 30 or "=" not in v:
-                folder_id, err = _resolve_folder_id(token, v)
-                if err:
-                    return {}, f"{k}: {err}"
+            # Always try name resolution first (covers well-known names + custom
+            # folders by displayName). If lookup says "no folder named ..." AND
+            # the value looks like a Graph ID, pass through verbatim so callers
+            # that already have an ID still work. Other errors propagate.
+            folder_id, err = _resolve_folder_id(token, v)
+            if folder_id:
                 out[k] = folder_id
-            else:
+            elif err and "no folder named" in err and _looks_like_folder_id(v):
                 out[k] = v
+            else:
+                return {}, f"{k}: {err}"
         else:
             out[k] = v
     return out, None
@@ -832,9 +842,13 @@ def get_thread(message_id: str, max_messages: int = 10):
 
 
 _GRAPH_ALLOWED_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE"}
-_GRAPH_ALLOWED_PREFIXES = ("/me/", "/me", "/search/", "/search", "/users/me/")
+_GRAPH_ALLOWED_EXACT = {"/me", "/search"}
+_GRAPH_ALLOWED_PREFIXES = ("/me/", "/search/", "/users/me/")
 _GRAPH_MAX_RESPONSE_BYTES = 50_000
-_GRAPH_HARD_DELETE_MESSAGE_RE = re.compile(r"^/me/messages/[^/]+/?$")
+# Match any DELETE whose path ends in /messages/{id} so hard-deletes via
+# folder-scoped paths (e.g. /me/mailFolders/inbox/messages/{id}) are also
+# blocked, not just /me/messages/{id}.
+_GRAPH_HARD_DELETE_MESSAGE_RE = re.compile(r"/messages/[^/]+/?$")
 
 
 def outlook_graph(
@@ -878,7 +892,9 @@ def outlook_graph(
     else:
         path_only, query_str = path, None
 
-    if not any(path_only.startswith(p) for p in _GRAPH_ALLOWED_PREFIXES):
+    if path_only not in _GRAPH_ALLOWED_EXACT and not any(
+        path_only.startswith(p) for p in _GRAPH_ALLOWED_PREFIXES
+    ):
         return {
             "ok": False,
             "error": (
