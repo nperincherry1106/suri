@@ -1,15 +1,23 @@
 import json
 import os
 import sys
+import uuid
 from datetime import datetime
 
 from anthropic import Anthropic
 
 from app import accounts, db
-from app.tools import memory, outlook, reminders
+from app.tools import audit, memory, outlook, reminders
 from app.tools.outlook import OutlookAuthRequired
 
 MODEL = "claude-sonnet-4-5"
+COMPACT_MODEL = "claude-haiku-4-5-20251001"
+
+# When more than COMPACT_THRESHOLD messages have arrived since the last
+# summary, fold the oldest half into a new summary. Keeps live history
+# bounded while preserving long-running context.
+COMPACT_THRESHOLD = 30
+COMPACT_KEEP_LIVE = 15
 
 PERSONA = """You are Suri, Namrita's personal assistant. You handle the small life-logistics
 tasks that fall through the cracks because she's overwhelmed at work.
@@ -32,12 +40,25 @@ Behavior:
 - Default to action, not asking. If you can take a reasonable next step, take it.
 - For high-stakes or destructive actions (sending messages as her, spending
   money, batch deletes, canceling subscriptions), pause for explicit approval
-  before executing.
+  before executing. To make approval one tap instead of typed: end your
+  message with a line like
+      [CONFIRM]: <one-line description of what Yes will do>
+  on its own. The Telegram transport will detect the marker, strip it from
+  the visible message, and render Yes/No buttons. If she taps Yes you'll
+  receive a synthetic user message saying "yes — confirmed via button: ..."
+  and should then execute the action immediately. If she taps No, drop it.
+  Use [CONFIRM] for ANY gated action (drafts, deletes, blocks, rules,
+  subscription cancels). Don't use it for plain questions ("did you mean X?").
 - If a step takes >10 seconds, send a short "on it" first.
 - If she tells you a preference worth keeping ("I hate phone calls", "never
   unsubscribe me from USPS", "my partner is Alex"), call remember_fact so you
   have it next week. The "Known about the user" block below is your live
   memory — read from it every turn.
+- You push proactive briefs on a schedule: a morning brief (7am PT) and an
+  evening wrap-up (9pm PT). If she says "stop the morning briefs" / "no more
+  evening recaps" / "pause the daily updates", call remember_fact with key
+  "morning_brief" or "evening_wrap" and value "off". To re-enable, forget_fact
+  the same key. Confirm the change by name so she knows which one toggled.
 - If you don't have a tool for what she's asking, FIRST check whether
   outlook_graph could compose the call (it can do almost any Outlook action
   within her current scopes). Only say "I can't do that yet" once you've
@@ -53,7 +74,9 @@ Honesty (HARD RULES, no exceptions):
 3. The "Action ground truth" block in your system prompt is the authoritative
    record of what has actually happened (from the database). If your
    conversation memory disagrees with it, your memory is wrong — defer to
-   ground truth and tell her plainly.
+   ground truth and tell her plainly. For the FULL list of what you did
+   recently (not just the per-tool counts in ground truth), call
+   what_did_you_do.
 4. The "Connected accounts" block tells you which integrations she has
    actually authorized. BEFORE you say "let me check your inbox" / "I'll
    look at your calendar" / etc., verify the relevant provider is listed.
@@ -136,6 +159,34 @@ TOOLS = [
                 "max_results": {
                     "type": "integer",
                     "description": "Cap on items returned. Default 30, max 100.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "find_owed_replies",
+        "description": (
+            "Find inbox threads where Namrita is the one who owes a reply: "
+            "the most recent message is from someone else, she was addressed "
+            "(to/cc), it's older than days_threshold, and it's not marketing. "
+            "Sorted oldest-first by days_waiting.\n\n"
+            "WORKFLOW: Use when she asks 'what do I owe' / 'what am I behind "
+            "on' / 'who's waiting on me'. Also auto-included in the morning "
+            "brief — don't repeat unless she asks. After calling, surface as "
+            "'X people waiting on you for N+ days', list top 3-5 by sender + "
+            "subject. Offer to draft replies."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days_threshold": {
+                    "type": "integer",
+                    "description": "Min days waited before counting as owed. Default 2.",
+                },
+                "lookback_days": {
+                    "type": "integer",
+                    "description": "How many days of inbox to scan. Default 14.",
                 },
             },
             "required": [],
@@ -401,6 +452,89 @@ TOOLS = [
         },
     },
     {
+        "name": "list_events",
+        "description": (
+            "List Namrita's calendar events in the next N days (and "
+            "optionally past M days). Returns subject, start, end, "
+            "location, attendees, and event_id (use with cancel_event).\n\n"
+            "Use for 'what's on my calendar' / 'what do I have today' / "
+            "'when am I free Friday'. Times are in Pacific."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days_ahead": {"type": "integer", "description": "Default 7."},
+                "days_back": {"type": "integer", "description": "Default 0."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "find_free_time",
+        "description": (
+            "Find calendar gaps of at least duration_minutes in the next "
+            "days_ahead days. Defaults: weekday 9am-6pm Pacific, skips "
+            "weekends. Returns up to 10 candidate slots.\n\n"
+            "WORKFLOW: use when she asks 'when am I free for X' / 'find "
+            "me 30 min this week'. Show top 3-5 slots, let her pick, then "
+            "call create_event."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "duration_minutes": {"type": "integer"},
+                "days_ahead": {"type": "integer", "description": "Default 7."},
+                "work_hours_only": {"type": "boolean", "description": "Default true (skip weekends, constrain to work hours)."},
+                "work_start_hour": {"type": "integer", "description": "Default 9."},
+                "work_end_hour": {"type": "integer", "description": "Default 18."},
+            },
+            "required": ["duration_minutes"],
+        },
+    },
+    {
+        "name": "create_event",
+        "description": (
+            "Create a calendar event and (if attendees) send invites.\n\n"
+            "WORKFLOW: HIGH STAKES. Always show the proposed event in chat "
+            "(title, time, attendees) and gate with [CONFIRM] before "
+            "calling. After it returns ok:true, share the web_link so she "
+            "can verify in Outlook.\n\n"
+            "start_iso/end_iso must be ISO 8601 with tz offset, e.g. "
+            "'2026-04-26T14:00:00-07:00'. Use the 'Current time' line in "
+            "your system prompt as anchor."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "start_iso": {"type": "string"},
+                "end_iso": {"type": "string"},
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Email addresses.",
+                },
+                "body": {"type": "string", "description": "Optional event body."},
+                "location": {"type": "string", "description": "Optional location string."},
+            },
+            "required": ["title", "start_iso", "end_iso"],
+        },
+    },
+    {
+        "name": "cancel_event",
+        "description": (
+            "Cancel/delete a calendar event by id (from list_events). For "
+            "events with attendees this AUTOMATICALLY sends cancellation "
+            "notices — never call without explicit approval. Gate with "
+            "[CONFIRM] when there are attendees."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"event_id": {"type": "string"}},
+            "required": ["event_id"],
+        },
+    },
+    {
         "name": "remember_fact",
         "description": (
             "Save a long-term fact about Namrita to persistent memory. Use "
@@ -435,6 +569,33 @@ TOOLS = [
             "type": "object",
             "properties": {"key": {"type": "string"}},
             "required": ["key"],
+        },
+    },
+    {
+        "name": "what_did_you_do",
+        "description": (
+            "Look up the actual tool calls Suri made in a recent window. "
+            "Use when Namrita asks 'what did you do today?' / 'what happened "
+            "while I was away?' / 'did you actually unsubscribe X?'.\n\n"
+            "This reads from the audit log (a database table updated every "
+            "time a tool is called), so it's authoritative — prefer it over "
+            "scrolling chat history.\n\n"
+            "After calling, summarize for her in plain English. Group by "
+            "tool when many calls happened. Call out failures (ok:false) "
+            "explicitly — don't bury them."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "since": {
+                    "type": "string",
+                    "description": (
+                        "Window: 'today' | '24h' | 'yesterday' (last 48h) | "
+                        "'7d' | 'week' | '<N>h' (e.g. '6h'). Default '24h'."
+                    ),
+                }
+            },
+            "required": [],
         },
     },
     {
@@ -523,6 +684,26 @@ def _ground_truth_block() -> str:
     else:
         parts.append("Active scheduled reminders: NONE.")
 
+    # Recent tool calls — collapses to a per-tool count + failures so the
+    # block stays short. For the full payload the agent should call
+    # what_did_you_do.
+    recent = db.recent_agent_actions(hours_back=24, limit=200)
+    if recent:
+        counts: dict[str, int] = {}
+        failures: list[str] = []
+        for a in recent:
+            counts[a["tool_name"]] = counts.get(a["tool_name"], 0) + 1
+            if not a["ok"]:
+                err = a["result"]
+                if isinstance(err, dict):
+                    err = err.get("error") or err.get("note") or "ok:false"
+                failures.append(f"  - {a['tool_name']}: {str(err)[:120]}")
+        summary = ", ".join(f"{k}×{v}" for k, v in sorted(counts.items()))
+        section = f"Recent tool calls (last 24h):\n  {summary}"
+        if failures:
+            section += "\nRecent FAILURES (be honest about these):\n" + "\n".join(failures[:10])
+        parts.append(section)
+
     return "Action ground truth (from database — this is REALITY):\n\n" + "\n\n".join(parts)
 
 
@@ -533,6 +714,12 @@ def _system_prompt() -> str:
     accounts_block = accounts.status_block()
     facts = db.user_facts()
     sections = [PERSONA, time_block, truth_block, accounts_block]
+    summary = db.latest_summary()
+    if summary:
+        sections.append(
+            "Earlier conversation summary (everything before the live history "
+            f"below, last updated {summary['created_at']}):\n{summary['summary']}"
+        )
     if facts:
         facts_block = "Known about the user:\n" + "\n".join(
             f"- {k}: {v}" for k, v in facts.items()
@@ -542,8 +729,10 @@ def _system_prompt() -> str:
 
 
 def _history():
+    summary = db.latest_summary()
+    after_id = summary["covers_through_message_id"] if summary else 0
     msgs = []
-    for d, b in db.recent_messages(20):
+    for d, b in db.recent_messages(20, after_id=after_id):
         role = "user" if d == "inbound" else "assistant"
         if msgs and msgs[-1]["role"] == role:
             msgs[-1]["content"] += "\n\n" + b
@@ -557,7 +746,65 @@ def _history():
     return msgs
 
 
-def _execute_tool(name: str, input_: dict):
+def _compact_if_needed():
+    """If too many messages have accumulated since the last summary, fold the
+    older half into a new summary via Haiku. Synchronous — adds ~1-2s to the
+    triggering turn. Errors are logged and swallowed so a Haiku outage can't
+    break the user-facing turn."""
+    summary = db.latest_summary()
+    after_id = summary["covers_through_message_id"] if summary else 0
+    pending = db.messages_since(after_id=after_id, limit=COMPACT_THRESHOLD * 4)
+    if len(pending) <= COMPACT_THRESHOLD:
+        return
+
+    # Summarize everything except the most recent COMPACT_KEEP_LIVE messages
+    # so the live window still has continuity into the new summary.
+    to_summarize = pending[:-COMPACT_KEEP_LIVE]
+    last_id = to_summarize[-1][0]
+
+    transcript = "\n".join(
+        f"{'NAMRITA' if d == 'inbound' else 'SURI'}: {b}"
+        for _, d, b in to_summarize
+    )
+    prior_summary = summary["summary"] if summary else ""
+
+    prompt_parts = []
+    if prior_summary:
+        prompt_parts.append(
+            f"PREVIOUS SUMMARY (covers everything before the transcript):\n{prior_summary}\n"
+        )
+    prompt_parts.append(
+        "NEW TRANSCRIPT TO FOLD IN:\n" + transcript + "\n\n"
+        "Update the summary so it captures what's important about Namrita's "
+        "ongoing context — open threads, decisions she's made, things Suri "
+        "has done or promised, recurring themes, anything that future-Suri "
+        "needs to remember to be useful. 5-10 hyphen bullets, no preamble, "
+        "no markdown. Don't list every action — that's in the audit log."
+    )
+
+    try:
+        resp = _get_client().messages.create(
+            model=COMPACT_MODEL,
+            max_tokens=600,
+            messages=[{"role": "user", "content": "\n".join(prompt_parts)}],
+        )
+    except Exception as e:
+        print(f"[compact] failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return
+
+    new_summary = "".join(b.text for b in resp.content if b.type == "text").strip()
+    if not new_summary:
+        print("[compact] empty summary, skipping", file=sys.stderr, flush=True)
+        return
+    db.save_summary(new_summary, last_id)
+    print(
+        f"[compact] folded {len(to_summarize)} msgs through id={last_id}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _execute_tool(name: str, input_: dict, turn_id: str):
     print(f"[tool] {name}({input_})", file=sys.stderr, flush=True)
     if name == "outlook_graph":
         result = outlook.outlook_graph(
@@ -574,6 +821,11 @@ def _execute_tool(name: str, input_: dict):
     elif name == "get_thread":
         result = outlook.get_thread(
             input_["message_id"], max_messages=input_.get("max_messages", 10)
+        )
+    elif name == "find_owed_replies":
+        result = outlook.find_owed_replies(
+            days_threshold=input_.get("days_threshold", 2),
+            lookback_days=input_.get("lookback_days", 14),
         )
     elif name == "delete_email":
         result = outlook.delete_email(input_["message_id"])
@@ -599,6 +851,30 @@ def _execute_tool(name: str, input_: dict):
         result = outlook.list_inbox_rules()
     elif name == "delete_inbox_rule":
         result = outlook.delete_inbox_rule(input_["rule_id"])
+    elif name == "list_events":
+        result = outlook.list_events(
+            days_ahead=input_.get("days_ahead", 7),
+            days_back=input_.get("days_back", 0),
+        )
+    elif name == "find_free_time":
+        result = outlook.find_free_time(
+            duration_minutes=input_["duration_minutes"],
+            days_ahead=input_.get("days_ahead", 7),
+            work_hours_only=input_.get("work_hours_only", True),
+            work_start_hour=input_.get("work_start_hour", 9),
+            work_end_hour=input_.get("work_end_hour", 18),
+        )
+    elif name == "create_event":
+        result = outlook.create_event(
+            title=input_["title"],
+            start_iso=input_["start_iso"],
+            end_iso=input_["end_iso"],
+            attendees=input_.get("attendees"),
+            body=input_.get("body", ""),
+            location=input_.get("location", ""),
+        )
+    elif name == "cancel_event":
+        result = outlook.cancel_event(input_["event_id"])
     elif name == "remember_fact":
         result = memory.remember_fact(input_["key"], input_["value"])
     elif name == "forget_fact":
@@ -609,6 +885,8 @@ def _execute_tool(name: str, input_: dict):
         result = reminders.list_reminders()
     elif name == "cancel_reminder":
         result = reminders.cancel_reminder(input_["id"])
+    elif name == "what_did_you_do":
+        result = audit.what_did_you_do(since=input_.get("since", "24h"))
     else:
         result = {"ok": False, "error": f"unknown tool: {name}"}
     # Truncate large results in the log
@@ -618,6 +896,17 @@ def _execute_tool(name: str, input_: dict):
         s = str(result)
         log_view = s if len(s) <= 300 else s[:300] + "...[truncated]"
     print(f"[tool] -> {log_view}", file=sys.stderr, flush=True)
+    # Persist for ground-truth + what_did_you_do. ok:false dicts are still
+    # logged — failures are part of the audit trail. Skip self-logging
+    # what_did_you_do calls so the tool's own queries don't pollute results.
+    if name != "what_did_you_do":
+        ok = True
+        if isinstance(result, dict) and result.get("ok") is False:
+            ok = False
+        try:
+            db.log_agent_action(turn_id, name, input_, result, ok)
+        except Exception as e:
+            print(f"[audit] log failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
     return result
 
 
@@ -637,8 +926,12 @@ def handle(send=None) -> list[str]:
     """Run the agent loop. Calls `send(text)` for each agent message as it
     happens (so callers can stream "on it" before tool calls finish). Also
     returns the full list of messages sent."""
+    _compact_if_needed()
     messages = _history()
     sent: list[str] = []
+    # One turn_id per user message → spans every tool call in this loop.
+    # Lets the audit log group "what happened in response to that ask".
+    turn_id = uuid.uuid4().hex[:12]
     while True:
         resp = _get_client().messages.create(
             model=MODEL,
@@ -662,12 +955,13 @@ def handle(send=None) -> list[str]:
             if block.type != "tool_use":
                 continue
             try:
-                result = _execute_tool(block.name, block.input)
+                result = _execute_tool(block.name, block.input, turn_id)
             except OutlookAuthRequired as e:
                 # _token() already pushed the magic link to the user. Bail out
                 # of the agent loop entirely — the OAuth callback will replay
                 # the original prompt once consent completes. Don't feed an
-                # error back to Claude; we don't want a half-answer.
+                # error back to Claude; we don't want a half-answer. Skip
+                # the audit log too: the auth prompt isn't a tool failure.
                 print(
                     f"[agent] outlook auth required (state={e.state}); "
                     "bailing until callback fires.",
@@ -677,6 +971,10 @@ def handle(send=None) -> list[str]:
                 return sent
             except Exception as e:
                 result = {"error": f"{type(e).__name__}: {e}"}
+                try:
+                    db.log_agent_action(turn_id, block.name, block.input, result, False)
+                except Exception as log_e:
+                    print(f"[audit] log failed: {type(log_e).__name__}: {log_e}", file=sys.stderr, flush=True)
             tool_results.append(
                 {
                     "type": "tool_result",

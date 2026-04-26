@@ -9,9 +9,10 @@ import sys
 from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
-from app import db, push
+from app import db, proactive, push
 
 
 _scheduler: BackgroundScheduler | None = None
@@ -25,7 +26,24 @@ def start():
         return
     _scheduler = BackgroundScheduler(timezone="UTC")
     _scheduler.start()
-    print("[scheduler] engine started", file=sys.stderr, flush=True)
+    # Cron triggers carry their own timezone, so PT cadence works regardless
+    # of the engine's UTC default.
+    _scheduler.add_job(
+        proactive.morning_brief,
+        trigger=CronTrigger(hour=7, minute=0, timezone="America/Los_Angeles"),
+        id="proactive-morning-brief",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    _scheduler.add_job(
+        proactive.evening_wrap,
+        trigger=CronTrigger(hour=21, minute=0, timezone="America/Los_Angeles"),
+        id="proactive-evening-wrap",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    print("[scheduler] engine started + proactive cadence registered (7am / 9pm PT)",
+          file=sys.stderr, flush=True)
 
 
 def restore_pending():

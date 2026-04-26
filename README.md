@@ -23,10 +23,8 @@ Verified end-to-end:
 ## What Suri can't do yet
 
 - Cancel paid subscriptions (the original v0 ask — needs per-service browser flows)
-- Calendar (would need `Calendars.ReadWrite` scope and tools)
 - Voice notes (Telegram → Whisper → Suri)
 - Multi-user / sharing
-- Cloud deploy / always-on (currently runs from your laptop)
 
 ## Architecture
 
@@ -91,6 +89,7 @@ cp .env.example .env
 7. Open **API permissions** → Add a permission → Microsoft Graph → Delegated → check:
    - `Mail.ReadWrite`
    - `MailboxSettings.ReadWrite` (required for inbox rules)
+   - `Calendars.ReadWrite` (calendar tools)
 8. Grant admin consent (or just consent on first auth).
 9. Copy the **Application (client) ID** into `MS_CLIENT_ID` in `.env`.
 
@@ -100,6 +99,12 @@ cp .env.example .env
 - **Deployed without `SURI_PUBLIC_URL`**: device-code fallback. Suri sends a microsoft.com/link URL plus a code; you sign in there.
 
 After auth, the token cache (`outlook_token.json`) persists to the data volume — refreshes silently for ~90 days.
+
+**Adding more capabilities later:** if you (or a future Suri update) need a
+new Microsoft scope that isn't in the list above, Suri detects the missing
+permission, DMs you a deep link to the right Azure portal page, and tells
+you exactly which checkbox to tick. Tap, check, save, reply "try again" —
+Suri handles the consent prompt inline. No SSH, no file deletion.
 
 ## Run
 
@@ -122,13 +127,17 @@ app/
   agent.py           # persona, tools list, agent loop with Claude
   telegram_bot.py    # Telegram transport, markdown stripper, push channel
   oauth_server.py    # FastAPI server for OAuth magic-link callbacks
+  accounts.py        # derived view of connected integrations (system prompt)
+  proactive.py       # morning brief + evening wrap-up + reminder pushes
   cli.py             # terminal REPL for dev
   scheduler.py       # APScheduler wrapper, push callback registration
+  push.py            # generic outbound push channel (used by tools + scheduler)
   db.py              # SQLite schema + helpers
   tools/
-    outlook.py       # all Microsoft Graph calls (~1100 lines)
+    outlook.py       # all Microsoft Graph calls (~1700 lines)
     memory.py        # remember_fact / forget_fact
     reminders.py     # set/list/cancel reminders
+    audit.py         # what_did_you_do tool (reads the agent_actions log)
 data/
   sai.db             # gitignored
 PLAN.md              # original SMS-first plan, kept for historical context
@@ -150,7 +159,6 @@ The `unsubscribe_from` tool is also explicitly honest about uncertainty: it dist
 
 This is a personal weekend project, not a production system. If you want to fork it as a starting point or send a PR with an improvement, go for it. Things that would be especially useful:
 
-- **Calendar tools** — `Calendars.ReadWrite` scope plus list/find/create/cancel events.
 - **Skills system** — Anthropic-style markdown-skills the agent can read on-demand and (carefully) author. Was scoped but punted as too much complexity for now.
 - **Subscription cancellation** — the original v0 goal. Per-service Playwright flows for Netflix, Spotify, NYT, etc.
 - **Better email triage** — sender-importance signals (CRM-style), conversation-thread state ("you owe a reply"), VIP rules.
