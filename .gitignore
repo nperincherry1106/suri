@@ -5,7 +5,9 @@ __pycache__/
 venv/
 data/*.db
 data/*.db-journal
+data/*.log
+*.log
 *.egg-info/
 .playwright/
-gmail_token.json
-gmail_credentials.json
+outlook_token.json
+.DS_Store

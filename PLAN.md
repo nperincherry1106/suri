@@ -1,5 +1,13 @@
 # v0 Build Plan: Personal AI Agent (SMS-first)
 
+> **Note (post-build):** This is the *original* plan. The actual project pivoted
+> away from SMS/Twilio (compliance issues — Twilio kept treating me as a business
+> needing toll-free verification) to a Telegram bot, and from Gmail to Outlook
+> (my main email is Outlook). It also expanded scope from "cancel one subscription
+> end-to-end" to a broader life-admin assistant. See [`README.md`](./README.md) for
+> what actually got built. This file is preserved for context on the original
+> design intent and constraints.
+
 **For:** Claude Code, building a working prototype for an audience of one (the founder).
 **Goal:** Working SMS-based agent that can identify and cancel one of the founder's real subscriptions end-to-end, with one-tap approval.
 **Time budget:** One weekend (Saturday + Sunday afternoon). If it takes longer, the scope was wrong — cut, don't extend.
