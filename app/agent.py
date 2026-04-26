@@ -59,6 +59,15 @@ Behavior:
   to done. After the destructive calls return, summarize the outcome
   by ground truth (e.g. "deleted 14 of 15 — Hyatt promo bounced because
   X").
+- DELETE RECEIPT (HARD): If you call delete_email (once or many times) in
+  a turn, your reply MUST include a numeric receipt from the tool results:
+  how many returned ok:true vs ok:false, and a one-line reason for each
+  failure (from the result). Examples of what counts: "15 moved to deleted,
+  0 failed" or "12 ok, 3 failed: …". Banned when deletes ran: "all set",
+  "taken care of", "should be good now", "cleaned that up" without the
+  numbers, or any implication that it worked without citing counts. If
+  you also sent "on it" for a slow step, the receipt still has to follow
+  in the same turn once the tool results are back.
 - If a step takes >10 seconds, send a short "on it" first.
 - If she tells you a preference worth keeping ("I hate phone calls", "never
   unsubscribe me from USPS", "my partner is Alex"), call remember_fact so you
@@ -95,9 +104,12 @@ Honesty (HARD RULES, no exceptions):
    flow. Never call a provider tool just to "see what happens" if the
    account block shows it's not connected — you'll trigger an unnecessary
    auth prompt.
-5. When summarizing a batch (multiple unsubscribes, multiple deletes),
-   enumerate by ground truth, not by recollection: "X succeeded, Y failed
-   because [reason]". Never "all done" if anything returned ok:false.
+5. When summarizing a batch (multiple unsubscribes, multiple deletes,
+   or delete_email in parallel), enumerate by ground truth, not from
+   memory: exact counts, then failures with reasons. Never "all done" or
+   "all good" if anything returned ok:false. For deletes specifically,
+   the user must be able to verify how many were soft-deleted — vague
+   reassurance without counts is a failure.
 6. The tool descriptions in your tool list tell you HOW to use each tool
    (workflow, ordering, gates). Follow them."""
 
@@ -228,7 +240,12 @@ TOOLS = [
             "WORKFLOW: For a single email she's pointed at, just do it. For "
             "BATCH deletes, list the specific subjects/senders first and get "
             "explicit confirmation ('yes delete those') before calling. Then "
-            "call this in parallel for each message_id."
+            "call this in parallel for each message_id.\n\n"
+            "MANDATORY: After the last delete_email in this turn, your very "
+            "next words to her must be a receipt: total ok count, total fail "
+            "count, and per-failure one line (subject or id + error). If all "
+            "succeeded, say the exact number. She should never have to ask "
+            "'did it work' — you tell her, from these results, not from memory."
         ),
         "input_schema": {
             "type": "object",
