@@ -42,8 +42,25 @@ def start():
         replace_existing=True,
         misfire_grace_time=3600,
     )
-    print("[scheduler] engine started + proactive cadence registered (7am / 9pm PT)",
-          file=sys.stderr, flush=True)
+    # Mon–Fri only; 0=Mon … 4=Fri in APScheduler. Skips if nothing to surface.
+    _scheduler.add_job(
+        proactive.weekday_midday_nudge,
+        trigger=CronTrigger(
+            hour=12,
+            minute=0,
+            day_of_week="0-4",
+            timezone="America/Los_Angeles",
+        ),
+        id="proactive-midday-nudge",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    print(
+        "[scheduler] engine started + proactive: 7am / noontime* / 9pm PT "
+        "(*=weekdays, only if nudge-worthy)",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def restore_pending():
