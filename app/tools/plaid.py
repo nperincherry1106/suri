@@ -61,6 +61,30 @@ def _client_user_id() -> str:
     return f"suri-user-{u}" if u else "suri-user-default"
 
 
+def _get_or_create_plaid_api_user_id(client) -> tuple[str | None, str | None]:
+    """Plaid `user_id` from /user/create — required when using multi-item Link (Dec 2025+).
+    Persisted in user_facts. Returns (user_id, error_message)."""
+    existing = db.user_facts().get("plaid_user_id", "").strip()
+    if existing:
+        return existing, None
+    from plaid.model.user_create_request import UserCreateRequest
+
+    try:
+        r = client.user_create(
+            UserCreateRequest(client_user_id=_client_user_id())
+        )
+        d = r.to_dict() if hasattr(r, "to_dict") else {}
+        uid = d.get("user_id") or (getattr(r, "user_id", None) if not d else None)
+        if not uid:
+            return None, "plaid /user/create returned no user_id (check Plaid dashboard / API access)"
+        db.set_fact("plaid_user_id", str(uid))
+        return str(uid), None
+    except Exception as e:
+        err = _plaid_error(e)
+        print(f"[plaid] user_create failed: {err}", file=sys.stderr, flush=True)
+        return None, f"plaid /user/create failed: {err}"
+
+
 def public_base_url() -> str | None:
     u = os.environ.get("SURI_PUBLIC_URL", "").rstrip("/")
     return u or None
@@ -182,7 +206,18 @@ def start_link() -> dict:
     webhook = f"{base}/plaid/webhook" if base else None
 
     try:
+        # Multi-item Link requires a Plaid user from /user/create (see
+        # https://plaid.com/docs/link/multi-item-link/ ).
+        puid, uerr = _get_or_create_plaid_api_user_id(client)
+        if uerr or not puid:
+            return {
+                "ok": False,
+                "error": uerr or "could not create Plaid user",
+                "config": status,
+                "hint": "Plaid now requires /user/create before link when multi-bank in one session is enabled. This should be automatic — if it failed, the message above is from Plaid's API.",
+            }
         req = LinkTokenCreateRequest(
+            user_id=puid,
             user=LinkTokenCreateRequestUser(client_user_id=_client_user_id()),
             client_name="Suri",
             products=[Products("transactions")],

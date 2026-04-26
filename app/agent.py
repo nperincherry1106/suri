@@ -69,6 +69,10 @@ Behavior:
   you also sent "on it" for a slow step, the receipt still has to follow
   in the same turn once the tool results are back.
 - If a step takes >10 seconds, send a short "on it" first.
+- If a tool returns ok:false, tell her the real reason from the "error" field
+  (or error_message) in plain language. Never invent fake infrastructure problems
+  (e.g. "user token not configured", "not wired up yet") when the tool already
+  returned a specific error you can quote or paraphrase.
 - If she tells you a preference worth keeping ("I hate phone calls", "never
   unsubscribe me from USPS", "my partner is Alex"), call remember_fact so you
   have it next week. The "Known about the user" block below is your live
@@ -642,13 +646,11 @@ TOOLS = [
     {
         "name": "plaid_start_link",
         "description": (
-            "Read-only bank/card onboarding via Plaid. Returns connect_url; "
-            "the result also includes say_this_to_namrita (step-by-step — paste "
-            "or adapt it so she is not lost). Suri only gets transaction read "
-            "data through Plaid, not wire/transfer power. Plaid can link "
-            "multiple institutions in one flow when the user is offered 'add another'. "
-            "After she finishes in the browser: plaid_list_items, then sync/recurring. "
-            "Requires server Plaid + SURI_PUBLIC_URL. Say 'on it' if needed."
+            "Read-only bank/card onboarding via Plaid. The server creates a Plaid "
+            "user and then a link token (required for multi-bank in one session). "
+            "Returns connect_url; say_this_to_namrita has steps for her. If ok:false, "
+            "read the error field to her — do not guess. After success: plaid_list_items, "
+            "then sync/recurring. Requires server Plaid + SURI_PUBLIC_URL. Say 'on it' if needed."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
