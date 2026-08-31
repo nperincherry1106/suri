@@ -1,6 +1,6 @@
 # Suri (SAI)
 
-A personal AI assistant that handles small life-logistics tasks through Telegram. Built for one user (the founder) over a weekend; sharing publicly so others can fork, learn from, or improve.
+A personal AI assistant that handles small life-logistics tasks through Telegram. Built for one user (myself); currently provate repo but might share publicly at some point so others can fork, learn from, or improve.
 
 This started as an SMS-first subscription canceller (see [`PLAN.md`](./PLAN.md) for the original plan) and pivoted into a Telegram bot with Outlook integration after Twilio compliance wouldn't let me send messages without registering as a business.
 
