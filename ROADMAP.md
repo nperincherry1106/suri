@@ -2,6 +2,10 @@
 
 This is the **forward-looking** plan. For history and the original v0 spec, see [`PLAN.md`](./PLAN.md). For what works today, see [`README.md`](./README.md).
 
+## North star
+
+Bring **agentic AI to normal people** — not as a demo or a chat wrapper, but as a companion that quietly handles life's small logistics: email, money, schedules, subscriptions, the hundred things that aren't hard individually but pile up and steal attention. Enterprise AI gets most of the investment; Suri is the bet that everyone deserves an assistant that actually acts on their behalf, with confirmation gates where it matters.
+
 **Principles (unchanged):** single user for now, Telegram as the main surface until a native app earns its place, SQLite + boring Python, no auto-send on high-stakes actions. Anything that **sends email on your behalf** or has **irreversible external effects** must pause for **explicit confirmation** (same family as today’s Outlook `[CONFIRM]` / Yes–No, extended to “send this Gmail” when we add that).
 
 ---
@@ -10,7 +14,7 @@ This is the **forward-looking** plan. For history and the original v0 spec, see 
 
 **Goal:** Suri can ground answers in **card and bank data** (recurring debits, merchants, amounts, dates), not just inbox text.
 
-**Status (MVP in repo):** `plaid_start_link` → browser `/plaid/link/{session}` (Plaid Link) → `POST /plaid/exchange` → tokens in `plaid_items` table. Tools: `plaid_list_items`, `plaid_sync_transactions`, `plaid_recurring`. Webhook `POST /plaid/webhook` logs payloads (re-auth handling later). Set `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV`, and `SURI_PUBLIC_URL` (Plaid dashboard webhook: `<SURI_PUBLIC_URL>/plaid/webhook`).
+**Status (done in production):** `plaid_start_link` → browser `/plaid/link/{session}` (Plaid Link) → `POST /plaid/exchange` → tokens in `plaid_items` table. Tools: `plaid_list_items`, `plaid_sync_transactions`, `plaid_recurring`. Webhook `POST /plaid/webhook` logs payloads (re-auth handling later). Set `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV=production`, and `SURI_PUBLIC_URL`. Webhook URL is registered automatically via link token — no Plaid dashboard step.
 
 - Add Plaid to the **server only** (client id/secret, env, Fly secrets). iOS is out of scope for this phase.
 - Persist Plaid **items** and **access tokens** in SQLite (treat tokens as secret; log errors without leaking tokens).

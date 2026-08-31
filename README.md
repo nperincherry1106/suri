@@ -1,8 +1,16 @@
 # Suri (SAI)
 
-A personal AI assistant that handles small life-logistics tasks. Built for one user; shared publicly so others can fork, learn from, or improve.
+A personal AI assistant that handles the small, repetitive, hard-to-manage tasks that fill a normal life. Built for one user first; shared publicly so others can fork, learn from, or improve.
 
 Suri started as an SMS subscription canceller ([`PLAN.md`](./PLAN.md)), became a **Telegram bot** with Outlook integration, and is now a **Telegram-first life-admin agent** deployed on [Fly.io](https://fly.io) — with an iOS app in progress as a future surface. Chat today is Telegram; the backend also exposes OAuth/Plaid webhooks and a growing `/api/v1/*` for the iOS client.
+
+## Why Suri
+
+Most AI products are built for enterprises — sales copilots, coding agents, internal knowledge bases. That's useful, but it ignores the life everyone actually lives outside work: the inbox that won't stay empty, the subscription you forgot about, the charge that doesn't match the receipt, the reminder you meant to set yesterday. Even CEOs and executives have that life. Everyone does.
+
+Agentic AI is already capable enough to handle those tasks. The gap isn't intelligence — it's access. You shouldn't need a technical background, a custom dev setup, or an engineer on retainer to get an agent that actually *does things* in your email and bank accounts.
+
+**Suri is the companion that handles those things.** Not a chatbot that gives advice — an assistant that triages your inbox, tracks your spending, runs on the schedule you set, and waits for your OK before anything irreversible. The long-term bet: normal people should be able to use agentic AI to its fullest extent, the same way power users do today, without thinking about APIs, prompts, or infrastructure.
 
 **What's next:** [ROADMAP.md](./ROADMAP.md)
 
