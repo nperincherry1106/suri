@@ -1,70 +1,63 @@
 # Suri (SAI)
 
-A personal AI assistant that handles small life-logistics tasks through Telegram. Built for one user (the founder) over a weekend; sharing publicly so others can fork, learn from, or improve.
+A personal AI assistant that handles small life-logistics tasks. Built for one user; shared publicly so others can fork, learn from, or improve.
 
-This started as an SMS-first subscription canceller (see [`PLAN.md`](./PLAN.md) for the original plan) and pivoted into a Telegram bot with Outlook integration after Twilio compliance wouldn't let me send messages without registering as a business.
+Suri started as an SMS subscription canceller ([`PLAN.md`](./PLAN.md)), became a **Telegram bot** with Outlook integration, and is now a **Telegram-first life-admin agent** deployed on [Fly.io](https://fly.io) — with an iOS app in progress as a future surface. Chat today is Telegram; the backend also exposes OAuth/Plaid webhooks and a growing `/api/v1/*` for the iOS client.
 
-**What’s next:** [ROADMAP.md](./ROADMAP.md) (Plaid, full Gmail with confirm-before-send, unified subscription view, iOS when needed).
+**What's next:** [ROADMAP.md](./ROADMAP.md)
 
-## What Suri can actually do today
+## What Suri can do today
 
-Verified end-to-end:
+Verified end-to-end via Telegram:
 
-- **Triage your Outlook inbox** — pulls recent mail, groups it into urgent / waiting on you / FYI / noise.
-- **Summarize email threads** — fetches the full conversation and gives you the gist.
-- **Draft replies** — writes a draft into your Outlook Drafts folder. You open Outlook and click Send. Suri never auto-sends mail.
-- **Soft-delete emails** — single or batch (with explicit confirmation), recoverable from Deleted Items for ~30 days.
-- **Find marketing senders + unsubscribe** — scans your inbox for `List-Unsubscribe` headers, then tries three methods in order: RFC 8058 one-click POST → headless-browser confirm-button click (Playwright) → hand the URL back to you.
-- **Block senders + create inbox rules** — `block_sender` is a one-line wrapper around the more general `create_inbox_rule`, which can move/copy/flag/mark-read/delete/forward by sender, subject, body, attachments, importance, etc.
-- **Find paid subscriptions** — scans your inbox for receipts/renewals/invoices to estimate what you're paying for. Detection only; doesn't cancel.
-- **Plaid (optional, read-only)** — you sign in through Plaid’s own bank window; Suri only gets **transaction** data (no moving money). One link session can add **multiple** banks when Plaid offers “add another.” Ask Suri for `plaid_start_link` — the hosted page explains **sandbox** test logins vs production. Configure `PLAID_*` + `SURI_PUBLIC_URL` on the server. See [ROADMAP.md](./ROADMAP.md) Phase 1.
-- **Outlook escape hatch** — `outlook_graph` lets the agent compose any Microsoft Graph call within the granted scopes, so new Outlook capabilities don't always need new code.
-- **Long-term memory** — `remember_fact` / `forget_fact` so you can teach Suri your preferences ("I hate phone calls", "never unsubscribe me from USPS") and they stick across conversations.
-- **Scheduled reminders** — `set_reminder` + APScheduler. Suri proactively pushes the reminder to your Telegram at the right time.
-- **Honesty infrastructure** — every system prompt includes a "ground truth" block read from the SQLite DB (what's actually been unsubscribed, what reminders are pending) so the agent can't fabricate past actions.
+- **Triage your Outlook inbox** — urgent / waiting on you / FYI / noise
+- **Summarize threads + draft replies** — drafts land in Outlook; Suri never auto-sends mail
+- **Soft-delete emails** — batch deletes with Yes/No confirmation in Telegram
+- **Marketing unsubscribe** — RFC 8058 one-click → Playwright confirm → hand you the URL
+- **Block senders + inbox rules** — move, flag, forward, auto-delete by sender/subject/etc.
+- **Find paid subscriptions (email)** — receipt/renewal detection from inbox; no cancel yet
+- **Plaid (read-only)** — connect real banks via Plaid Link; sync transactions + recurring charge streams. Multi-bank in one Link session. Production-ready on Fly.
+- **Spending + recurring payments (Plaid)** — `plaid_sync_transactions`, `plaid_recurring` after linking
+- **Long-term memory** — `remember_fact` / `forget_fact` for preferences
+- **One-shot reminders** — `set_reminder` pushes to Telegram at the scheduled time
+- **Recurring schedules** — `set_recurring_reminder` (daily/weekdays/custom) stored in SQLite; no redeploy needed. Includes `email_scan` action for nightly inbox digests.
+- **Proactive briefs** — 7am morning, 12pm weekday nudge (if warranted), 9pm evening wrap
+- **Honesty infrastructure** — ground-truth block in every turn so Suri can't fabricate past actions
 
 ## What Suri can't do yet
 
-- Cancel paid subscriptions (the original v0 ask — needs per-service browser flows)
-- Voice notes (Telegram → Whisper → Suri)
+- Cancel paid subscriptions (needs per-service browser flows)
+- Voice notes
 - Multi-user / sharing
 
 ## Architecture
 
 ```
 ┌──────────────────┐
-│  Telegram (you)  │   <-- you message Suri from your phone
+│  You (Telegram)  │
 └────────┬─────────┘
-         │  long-poll
-┌────────▼─────────────────────────────────┐
-│  app/telegram_bot.py                     │
-│   - allowlist (your user_id only)        │
-│   - markdown stripper for plain text     │
-│   - registers push callback for reminders│
-└────────┬─────────────────────────────────┘
+         │  long-poll + push
+┌────────▼─────────────────────────────────────────┐
+│  app/telegram_bot.py (Fly production entrypoint) │
+│   - Telegram transport + inline Yes/No confirms  │
+│   - oauth_server.app (FastAPI on :8080)          │
+│       /healthz, /plaid/*, /connect/*, /api/v1/*  │
+│   - APScheduler (briefs, reminders, recurring)   │
+└────────┬─────────────────────────────────────────┘
          │
 ┌────────▼──────────────────────────────────────┐
 │  app/agent.py — Claude Sonnet 4.5 + tools     │
-│   - persona (slim, general principles)        │
-│   - ground-truth injection per turn           │
-│   - tool dispatcher                           │
 └────────┬──────────────────────────────────────┘
          │
-   ┌─────┴────┬──────────┬───────────┬─────────────┐
-   ▼          ▼          ▼           ▼             ▼
-outlook.py  memory.py  reminders.py  db.py    scheduler.py
-(MS Graph)  (SQLite)   (SQLite +     (SQLite)  (APScheduler)
-            user_facts  scheduler)              + push callback
+   outlook.py  plaid.py  reminders.py  recurring_reminders.py
+   memory.py   db.py     scheduler.py  proactive.py
 ```
 
-**Stack:** Python 3.11, Anthropic SDK (Sonnet 4.5), `python-telegram-bot`, MSAL (Outlook OAuth), Microsoft Graph API, Playwright (headless Chromium for unsubscribe-page automation), APScheduler, SQLite (stdlib).
+**Stack:** Python 3.11, Anthropic SDK, FastAPI + uvicorn, python-telegram-bot, MSAL + Graph, Playwright, APScheduler, SQLite, Plaid Python SDK.
 
-**Storage (gitignored):**
-- `.env` — all secrets
-- `outlook_token.json` — MSAL token cache
-- `data/sai.db` — messages, user_facts, reminders, marketing_senders, paid_subscriptions, pending_actions
+**Storage on Fly (`/data` volume):** `sai.db`, `outlook_token.json`, Plaid item tokens.
 
-## Setup
+## Setup (local dev)
 
 ```bash
 python3.11 -m venv .venv
@@ -76,96 +69,98 @@ cp .env.example .env
 # fill in: ANTHROPIC_API_KEY, MS_CLIENT_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID
 ```
 
-### Telegram bot
+Set `SURI_HEADLESS=1` in `.env` so Outlook auth prompts go to Telegram instead of opening a browser in the background.
 
-1. DM `@BotFather` on Telegram → `/newbot` → follow prompts. You get a token. Put it in `TELEGRAM_BOT_TOKEN`.
-2. DM `@userinfobot` on Telegram. It tells you your numeric user id. Put it in `TELEGRAM_USER_ID`. Suri will only respond to messages from this id.
+### Microsoft Outlook
 
-### Microsoft Outlook (Azure app registration)
+See Azure app registration steps below (unchanged). For deployed Suri, register redirect URI:
 
-1. https://portal.azure.com → Microsoft Entra ID → App registrations → New registration.
-2. **Name**: anything (e.g. "Suri").
-3. **Supported account types**: "Personal Microsoft accounts only" (or both, if you have a work account too).
-4. **Redirect URI**: Public client/native → `http://localhost`. (Used for local dev / device-code fallback.)
-5. After creating, open the app → **Manifest** → set `"accessTokenAcceptedVersion": 2` (instead of `null`).
-6. **For deployed Suri (recommended)** — Authentication tab → Add a platform → "Mobile and desktop applications" → add `https://<your-app>.fly.dev/connect/outlook/callback`. This is the magic-link callback. Set `SURI_PUBLIC_URL=https://<your-app>.fly.dev` in your env so Suri builds the right link. Without this, deployed Suri falls back to device-code (typed 9-char codes — works, but worse UX).
-7. Open **API permissions** → Add a permission → Microsoft Graph → Delegated → check:
-   - `Mail.ReadWrite`
-   - `MailboxSettings.ReadWrite` (required for inbox rules)
-   - `Calendars.ReadWrite` (calendar tools)
-8. Grant admin consent (or just consent on first auth).
-9. Copy the **Application (client) ID** into `MS_CLIENT_ID` in `.env`.
+`https://<your-app>.fly.dev/connect/outlook/callback`
 
-**First-time auth flow:**
-- **Local dev** (`SURI_HEADLESS` unset): MSAL pops a browser tab on the first Outlook call.
-- **Deployed with `SURI_PUBLIC_URL`**: Suri sends a one-tap magic link in Telegram. You sign in with Microsoft, then come back to the chat — Suri auto-resumes your original message.
-- **Deployed without `SURI_PUBLIC_URL`**: device-code fallback. Suri sends a microsoft.com/link URL plus a code; you sign in there.
+and set `SURI_PUBLIC_URL` accordingly.
 
-After auth, the token cache (`outlook_token.json`) persists to the data volume — refreshes silently for ~90 days.
+### Plaid
 
-**Adding more capabilities later:** if you (or a future Suri update) need a
-new Microsoft scope that isn't in the list above, Suri detects the missing
-permission, DMs you a deep link to the right Azure portal page, and tells
-you exactly which checkbox to tick. Tap, check, save, reply "try again" —
-Suri handles the consent prompt inline. No SSH, no file deletion.
+1. [Plaid Dashboard](https://dashboard.plaid.com) → **Developers → Keys** (Production or Trial plan for real banks)
+2. Set on Fly: `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV=production`
+3. **No dashboard webhook needed** for Transactions — Suri registers `https://<app>.fly.dev/plaid/webhook` automatically when you connect a bank
+4. In Telegram: *"connect my bank"* → open the link → sign in through Plaid
+
+Plaid user IDs are stored per environment (`plaid_user_id_production` vs sandbox). Switching from sandbox to production clears stale IDs automatically.
+
+### Telegram
+
+Create a bot via [@BotFather](https://t.me/BotFather). Set `TELEGRAM_BOT_TOKEN` and your numeric `TELEGRAM_USER_ID` (only this user can talk to Suri).
 
 ## Run
+
+**Production (Fly):** `fly deploy -a suri` — Dockerfile runs `app.telegram_bot`.
+
+**Local Telegram bot:**
 
 ```bash
 python -m app.telegram_bot
 ```
 
-Now message your bot on Telegram. Suri only responds to your allowlisted user id; everyone else is silently ignored.
-
-A CLI interface for development is also available:
+**CLI dev REPL:**
 
 ```bash
 python -m app.cli
 ```
 
+**Alternative entrypoint** (FastAPI-only, no Telegram — used for iOS backend experiments):
+
+```bash
+python -m app.main
+```
+
+## Deploy
+
+```bash
+fly secrets set -a suri ANTHROPIC_API_KEY=... TELEGRAM_BOT_TOKEN=... # etc.
+fly deploy -a suri
+```
+
+Pushes to `main` auto-deploy via `.github/workflows/fly-deploy.yml` if `FLY_API_TOKEN` is set in GitHub repo secrets.
+
+Only run **one** Telegram poller at a time (local bot OR Fly — not both).
+
+## Azure Outlook registration (summary)
+
+1. https://portal.azure.com → App registrations → New registration
+2. Personal Microsoft accounts; redirect `http://localhost` for dev
+3. Add `https://<your-app>.fly.dev/connect/outlook/callback` for deploy
+4. Manifest: `"accessTokenAcceptedVersion": 2`
+5. API permissions: `Mail.ReadWrite`, `MailboxSettings.ReadWrite`, `Calendars.ReadWrite`
+6. Copy client ID → `MS_CLIENT_ID`
+
 ## Project layout
 
 ```
 app/
-  agent.py           # persona, tools list, agent loop with Claude
-  telegram_bot.py    # Telegram transport, markdown stripper, push channel
-  oauth_server.py    # FastAPI server for OAuth magic-link callbacks
-  accounts.py        # derived view of connected integrations (system prompt)
-  proactive.py       # morning brief + evening wrap-up + reminder pushes
-  cli.py             # terminal REPL for dev
-  scheduler.py       # APScheduler wrapper, push callback registration
-  push.py            # generic outbound push channel (used by tools + scheduler)
-  db.py              # SQLite schema + helpers
+  telegram_bot.py       # production entrypoint (Telegram + OAuth + scheduler)
+  agent.py              # Claude agent loop + tools
+  oauth_server.py       # FastAPI: OAuth, Plaid Link pages, webhooks, /api/v1
+  proactive.py          # morning/evening briefs, daily email scan
+  scheduler.py          # APScheduler + reminder/recurring restore
+  db.py                 # SQLite schema
   tools/
-    outlook.py       # all Microsoft Graph calls (~1700 lines)
-    memory.py        # remember_fact / forget_fact
-    reminders.py     # set/list/cancel reminders
-    audit.py         # what_did_you_do tool (reads the agent_actions log)
-data/
-  sai.db             # gitignored
-PLAN.md              # original SMS-first plan, kept for historical context
-README.md            # this file
-.env.example         # copy to .env and fill in
+    outlook.py          # Microsoft Graph
+    plaid.py            # Plaid Link, sync, recurring
+    reminders.py        # one-shot reminders
+    recurring_reminders.py  # repeating schedules (from Telegram, no deploy)
+    memory.py
+fly.toml                # Fly.io config (suri.fly.dev)
+.github/workflows/      # auto-deploy on push to main
+ios/                    # native app (in progress)
 ```
 
 ## Honesty design notes
 
-A recurring problem with LLM agents is they'll *say* they did something without actually calling the tool. Suri has three layers of defense:
-
-1. **Hard rules in the persona** — "if you SAY an action happened, you MUST have called the matching tool in this same turn and seen `ok:true`."
-2. **Ground-truth injection** — every system prompt includes a freshly-queried block of "what has actually happened" (which senders are unsubscribed, what reminders are pending, what facts are remembered). This overrides Suri's recollection if conversation history disagrees with the database.
-3. **Verbose tool logging to stderr** — every tool call and its result is logged so the user can verify when in doubt.
-
-The `unsubscribe_from` tool is also explicitly honest about uncertainty: it distinguishes "request sent, server ack'd" (RFC 8058 one-click POST) from "page text confirmed" (browser saw success language). The persona instructs Suri to say "request sent, should stop in 1-7 days" rather than "unsubscribed" for the unverified case.
-
-## Contributing
-
-This is a personal weekend project, not a production system. If you want to fork it as a starting point or send a PR with an improvement, go for it. Things that would be especially useful:
-
-- **Skills system** — Anthropic-style markdown-skills the agent can read on-demand and (carefully) author. Was scoped but punted as too much complexity for now.
-- **Subscription cancellation** — the original v0 goal. Per-service Playwright flows for Netflix, Spotify, NYT, etc.
-- **Better email triage** — sender-importance signals (CRM-style), conversation-thread state ("you owe a reply"), VIP rules.
+1. **Hard rules in the persona** — must call the tool and see `ok:true` before claiming an action happened
+2. **Ground-truth injection** — unsubscribes, reminders, recurring schedules, Plaid items from DB every turn
+3. **Tool logging to stderr** — every call logged for verification
 
 ## License
 
-MIT (do whatever you want with it).
+MIT

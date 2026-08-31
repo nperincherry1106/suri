@@ -4,6 +4,8 @@ Cadences (all America/Los_Angeles):
 - morning_brief 7:00: inbox + owed + today's reminders
 - weekday_midday_nudge 12:00 Mon–Fri only, and only if there's something
   to surface (owed replies and/or a reminder in the next 4h) — no spam
+- daily_email_scan 20:00: inbox scan (urgent / action needed / FYI) when
+  Namrita has asked for it via remember_fact("daily_email_scan", …)
 - evening_wrap 21:00: what you did today + tomorrow's reminders
 
 Composed morning/evening use Claude; midday is a short template to stay
@@ -122,6 +124,50 @@ def morning_brief():
         "Data:\n" + json.dumps(payload, default=str, indent=2)
     )
     _compose_and_push("morning", _PROACTIVE_PROMPT, user_msg)
+
+
+def daily_email_scan():
+    """8pm PT inbox scan. Runs when scheduled via recurring_reminders
+    (action=email_scan). Disable by cancel_recurring_reminder."""
+    try:
+        items = outlook.triage_inbox(hours_back=24, max_results=50)
+    except Exception as e:
+        print(
+            f"[proactive:email-scan] triage failed: {type(e).__name__}: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if not push.push(
+            "8pm email scan — couldn't reach outlook. say 'check my email' "
+            "if you want me to retry."
+        ):
+            print(
+                "[proactive:email-scan] push channel unavailable",
+                file=sys.stderr,
+                flush=True,
+            )
+        return
+    marketing_count = sum(1 for i in items if i.get("is_marketing"))
+    real_items = [i for i in items if not i.get("is_marketing")]
+    payload = {
+        "date": datetime.now().astimezone().date().isoformat(),
+        "inbox_last_24h_excluding_marketing": real_items,
+        "marketing_noise_count": marketing_count,
+    }
+    user_msg = (
+        "Compose Namrita's daily 8pm email scan. Plain text, hyphen bullets. "
+        "Open with '8pm scan' so she recognizes it. Group into exactly these "
+        "sections (omit any with no content):\n"
+        "- urgent: time-sensitive or from real humans, needs attention tonight\n"
+        "- action needed: she owes a reply or decision, not necessarily tonight\n"
+        "- fyi: worth knowing, no action required\n"
+        "- noise: one line on marketing volume (e.g. '23 promos — want me to "
+        "clear them?')\n\n"
+        "Be specific (sender + short subject). Never invent. If everything "
+        "real is empty, say 'quiet day — just {N} marketing emails'.\n\n"
+        "Data:\n" + json.dumps(payload, default=str, indent=2)
+    )
+    _compose_and_push("email-scan", _PROACTIVE_PROMPT, user_msg)
 
 
 def evening_wrap():

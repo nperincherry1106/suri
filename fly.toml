@@ -1,13 +1,14 @@
 # fly.toml — Suri deployment config.
 #
 # Notes:
-#   - [http_service] exposes the OAuth callback server on https://<app>.fly.dev.
-#     Used for the magic-link Outlook auth flow (see app/oauth_server.py).
-#     The Telegram bot still polls outbound — HTTP is only for OAuth redirects.
-#   - Single machine, no auto-stop: the Telegram long-poll connection can only
-#     have ONE active client per bot token. Two machines polling the same bot
-#     would produce 409 Conflicts every few seconds. Also, in-flight OAuth
-#     flows have state in SQLite — a second machine wouldn't see them.
+#   - [http_service] exposes the public surface on https://<app>.fly.dev:
+#     OAuth callbacks (Outlook magic-link), Plaid webhooks + hosted Link
+#     pages, /healthz, and (added in step 4 of the iOS plan) /api/v1/*
+#     for the iOS app.
+#   - Single machine, no auto-stop: in-flight OAuth flows + Plaid Link
+#     sessions live in SQLite on the local /data volume — a second machine
+#     wouldn't see them. APScheduler also runs in-process; multiple
+#     machines would fire each cron N times. Stay 1-of-1 until v0.1.
 #   - 1GB RAM: Chromium (used for unsubscribe pages) needs the headroom.
 #   - Volume at /data: SQLite db + outlook_token.json persist across deploys.
 #
@@ -30,8 +31,9 @@ primary_region = "sjc"  # San Jose — closest US west coast region to PT
 [http_service]
   internal_port = 8080
   force_https = true
-  # auto_stop disabled: bot polls Telegram + holds in-memory state we don't
-  # want torn down between requests.
+  # auto_stop disabled: APScheduler runs in-process and we don't want crons
+  # silently dropped. Also keeps the Outlook token cache + any pending OAuth
+  # state warm between requests.
   auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1

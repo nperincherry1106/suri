@@ -1,8 +1,9 @@
-"""HTTP server for OAuth magic-link flows. Runs in the same process as the
-Telegram bot (see telegram_bot._serve).
+"""HTTP server for OAuth magic-link flows + Plaid endpoints + Plaid webhooks.
+
+Mounted by app.main as the only public surface; serves on PORT (8080 on fly).
 
 Plaid: hosted Link at GET /plaid/link/{session_id}, JSON POST /plaid/exchange,
-and POST /plaid/webhook for Plaid server-to-server (logged; sync optional later).
+and POST /plaid/webhook for Plaid (LINK: exchange public_token(s) for multi-item sessions).
 
 Two endpoints for Outlook today:
   GET /connect/outlook/{state}        — short link Suri sends to the user.
@@ -31,11 +32,14 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from app import db
+from app import api as api_v1
+from app import db, push
+from app.tools import gmail as gmail_tool
 from app.tools import outlook
 from app.tools import plaid as plaid_tool
 
 app = FastAPI(title="suri-oauth", openapi_url=None, docs_url=None, redoc_url=None)
+app.include_router(api_v1.router)
 
 
 @app.exception_handler(Exception)
@@ -159,6 +163,11 @@ if (!window.Plaid) {{
   const handler = Plaid.create({{
     token: linkToken,
     onSuccess: function(publicToken, meta) {{
+      if (!publicToken) {{
+        st.innerHTML = "<span class='ok'>session finished. multi-bank link sends tokens to the server (not the browser) &mdash; your bank is saving now. check telegram in a few seconds, or ask suri for plaid_list_items.</span>";
+        btn.remove();
+        return;
+      }}
       st.textContent = "finishing up…";
       fetch("/plaid/exchange", {{
         method: "POST",
@@ -214,15 +223,123 @@ async def plaid_exchange(request: Request):
     return JSONResponse(content=out)
 
 
+async def _notify(text: str) -> None:
+    """Best-effort proactive push; never raises. Goes through the registered
+    transport (today: stderr stub via app.main; step 2: APNs)."""
+    try:
+        await push.push_async(text)
+    except Exception as e:
+        print(f"[plaid] push notify: {e}", file=sys.stderr, flush=True)
+
+
+def _summarize_sync_results(out: dict) -> str:
+    parts: list[str] = []
+    for p in out.get("per_item") or []:
+        nm = p.get("institution_name") or p.get("item_id") or "bank"
+        if p.get("ok") is False:
+            parts.append(f"{nm}: sync failed ({p.get('error') or 'unknown'})")
+            continue
+        n = p.get("new_transactions_fetched", 0)
+        parts.append(f"{nm}: {n} new tx")
+    return "; ".join(parts) if parts else "(no items)"
+
+
+async def _sync_after_link(item_ids: list[str]) -> None:
+    if not item_ids:
+        return
+    for iid in item_ids:
+        try:
+            out = await asyncio.to_thread(plaid_tool.sync_transactions, iid)
+            print(
+                f"[plaid] auto-sync after link item={iid} ok={out.get('ok')} "
+                f"summary={_summarize_sync_results(out)}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[plaid] auto-sync after link item={iid} crashed: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+async def _sync_after_transactions_webhook(item_id: str) -> None:
+    try:
+        out = await asyncio.to_thread(plaid_tool.sync_transactions, item_id)
+        print(
+            f"[plaid] auto-sync after TRANSACTIONS webhook item={item_id} "
+            f"ok={out.get('ok')} summary={_summarize_sync_results(out)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        added = 0
+        for p in out.get("per_item") or []:
+            added += int(p.get("new_transactions_fetched") or 0)
+        if added > 0:
+            await _notify(
+                f"plaid: pulled {added} new transaction(s). ask for plaid_recurring "
+                f"if you want me to pick out subscriptions."
+            )
+    except Exception as e:
+        print(
+            f"[plaid] auto-sync after TRANSACTIONS webhook item={item_id} crashed: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 @app.post("/plaid/webhook")
 async def plaid_webhook(request: Request):
-    """Plaid webhooks: log and return 2xx. Sync-on-webhook can be added later."""
     try:
         body = await request.json()
     except Exception:
         body = {"raw": (await request.body())[:2000].decode("utf-8", errors="replace")}
-    t = body.get("webhook_type") or body.get("type") or "unknown"
-    print(f"[plaid] webhook {t} keys={list(body.keys())[:12]}", file=sys.stderr, flush=True)
+    if not isinstance(body, dict):
+        print("[plaid] webhook non-object", file=sys.stderr, flush=True)
+        return {"received": True}
+
+    wtype = (body.get("webhook_type") or body.get("type") or "unknown")
+    wcode = body.get("webhook_code")
+    print(
+        f"[plaid] webhook {wtype} code={wcode} keys={list(body.keys())[:12]}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    out = await asyncio.to_thread(plaid_tool.process_link_webhook, body)
+    if not (out.get("ignored") or out.get("skipped")):
+        errs = out.get("errors") or []
+        item_ids = out.get("exchanged_item_ids") or []
+        n = len(item_ids)
+        if n and not errs:
+            await _notify(
+                f"plaid: linked {n} bank item(s). pulling your transactions now…"
+            )
+            asyncio.create_task(_sync_after_link(item_ids))
+        elif n and errs:
+            await _notify(
+                f"plaid: linked {n} item(s) but some exchanges failed. "
+                f"i'll keep what i got — try plaid_list_items."
+            )
+            asyncio.create_task(_sync_after_link(item_ids))
+        elif errs and not n:
+            await _notify(
+                "plaid: couldn't save a bank from the link session. "
+                "check suri logs and try a new bank link."
+            )
+
+    if (wtype or "").upper() == "TRANSACTIONS" and wcode in (
+        "HISTORICAL_UPDATE",
+        "SYNC_UPDATES_AVAILABLE",
+        "DEFAULT_UPDATE",
+    ):
+        iid = body.get("item_id")
+        if isinstance(iid, str) and iid:
+            asyncio.create_task(_sync_after_transactions_webhook(iid))
+
     return {"received": True}
 
 
@@ -291,34 +408,32 @@ async def outlook_callback(request: Request):
     db.delete_pending_oauth(state)
     print(f"[oauth] outlook connected for state={state}", file=sys.stderr, flush=True)
 
-    # Re-trigger the original prompt on the bot's event loop. Late import
-    # because telegram_bot imports this module's `app` indirectly via uvicorn.
-    from app import telegram_bot
-
     original_prompt = row["original_prompt"]
-    chat_id = int(row["telegram_user_id"])
 
     async def _resume():
         try:
-            await telegram_bot.push("outlook connected — picking up where we left off.")
+            await push.push_async("outlook connected — picking up where we left off.")
         except Exception as e:
             print(f"[oauth] confirmation push failed: {e}", file=sys.stderr, flush=True)
+        # The auto-resume of `original_prompt` used to run an agent turn back
+        # into Telegram. With Telegram removed and chat-in-app not yet built
+        # (lands in step ~10 of the iOS plan), there's no surface to render
+        # the agent's reply, so we just log it. Once /api/v1/chat/send is
+        # live we'll rewire this to enqueue the prompt for the next session.
         if original_prompt:
-            try:
-                await telegram_bot.run_turn(original_prompt, chat_id=chat_id)
-            except Exception as e:
-                print(
-                    f"[oauth] re-trigger raised: {type(e).__name__}: {e}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            print(
+                f"[oauth] would re-trigger prompt (deferred until chat-in-app): "
+                f"{original_prompt[:120]!r}",
+                file=sys.stderr,
+                flush=True,
+            )
 
-    telegram_bot.schedule_on_loop(_resume())
+    asyncio.create_task(_resume())
 
     return _page(
         "outlook connected",
         "<h1 class='ok'>outlook connected</h1>"
-        "<p>you can close this tab. suri's already on it back in telegram.</p>",
+        "<p>you can close this tab. open suri to keep going.</p>",
     )
 
 
@@ -347,3 +462,149 @@ async def start_outlook_auth(state: str):
         )
     flow = json.loads(row["flow_json"])
     return RedirectResponse(url=flow["auth_uri"], status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# Gmail magic-link OAuth (peer to outlook)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/connect/gmail/callback")
+async def gmail_callback(request: Request):
+    """Google's redirect target after the user consents. Exchange the
+    auth code for tokens, persist creds, and one-shot the pending row."""
+    params = dict(request.query_params)
+    if "error" in params:
+        err = params.get("error_description") or params.get("error")
+        return _page(
+            "couldn't connect gmail",
+            f"<h1 class='err'>couldn't connect gmail</h1>"
+            f"<p>google said: <code>{err}</code></p>"
+            "<p>try the connect link again from suri.</p>",
+            status=400,
+        )
+
+    state = params.get("state")
+    if not state:
+        raise HTTPException(status_code=400, detail="missing state")
+
+    row = db.get_pending_oauth(state)
+    if row is None or row["provider"] != "gmail":
+        return _page(
+            "link expired",
+            "<h1>link expired</h1>"
+            "<p>this gmail connect link was already used or has expired. "
+            "ask suri for a fresh one.</p>",
+            status=410,
+        )
+
+    flow_state = json.loads(row["flow_json"])
+    # Force https on the auth-response URL even if proxy headers were
+    # somehow stripped. oauthlib raises InsecureTransportError on http://
+    # and we know we're behind fly's TLS-terminating proxy in prod.
+    auth_response_url = str(request.url)
+    if auth_response_url.startswith("http://") and (os.environ.get("SURI_PUBLIC_URL") or "").startswith("https://"):
+        auth_response_url = "https://" + auth_response_url[len("http://"):]
+    try:
+        result = await asyncio.to_thread(
+            gmail_tool.complete_auth_code_flow,
+            flow_state,
+            auth_response_url,
+        )
+    except Exception as e:
+        print(
+            f"[gmail-oauth] token exchange raised: {type(e).__name__}: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _page(
+            "couldn't connect gmail",
+            f"<h1 class='err'>couldn't connect gmail</h1>"
+            f"<p><code>{type(e).__name__}: {e}</code></p>",
+            status=500,
+        )
+
+    if not result.get("ok"):
+        err = result.get("error") or str(result)
+        return _page(
+            "couldn't connect gmail",
+            f"<h1 class='err'>couldn't connect gmail</h1>"
+            f"<p>{err}</p>",
+            status=400,
+        )
+
+    db.delete_pending_oauth(state)
+    print(f"[gmail-oauth] connected for state={state}", file=sys.stderr, flush=True)
+
+    original_prompt = row["original_prompt"]
+
+    async def _resume():
+        try:
+            await push.push_async(
+                "gmail connected — i can see your inbox now."
+            )
+        except Exception as e:
+            print(f"[gmail-oauth] confirmation push failed: {e}", file=sys.stderr, flush=True)
+        if original_prompt:
+            print(
+                f"[gmail-oauth] would re-trigger prompt (deferred until chat-in-app): "
+                f"{original_prompt[:120]!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    asyncio.create_task(_resume())
+
+    note = "" if result.get("has_refresh_token") else (
+        "<p class='warn'>note: google didn't issue a refresh token. you may "
+        "have to re-authorize when the access token expires (~1h). this "
+        "usually means the consent screen wasn't fresh — try revoking "
+        "Suri at <a href='https://myaccount.google.com/permissions'>"
+        "myaccount.google.com/permissions</a> and tap the link again.</p>"
+    )
+    return _page(
+        "gmail connected",
+        "<h1 class='ok'>gmail connected</h1>"
+        "<p>you can close this tab. open suri to keep going.</p>"
+        + note,
+    )
+
+
+@app.get("/connect/gmail/{state}")
+async def start_gmail_auth(state: str):
+    """Short link Suri sends in chat. Builds the live Google OAuth URL
+    on demand (we didn't store auth_uri at flow-init time because the
+    google-auth-oauthlib Flow returns it inline) and 302s the user to
+    Google's consent screen."""
+    db.prune_expired_oauth(older_than_minutes=int(_LINK_TTL.total_seconds() / 60))
+    row = db.get_pending_oauth(state)
+    if row is None or row["provider"] != "gmail":
+        return _page(
+            "link expired",
+            "<h1>link expired</h1>"
+            "<p>this connect link isn't valid anymore. ask suri for a fresh one.</p>",
+            status=404,
+        )
+    if _is_expired(row["created_at"]):
+        db.delete_pending_oauth(state)
+        return _page(
+            "link expired",
+            "<h1>link expired</h1>"
+            "<p>this connect link sat too long. ask suri for a new one.</p>",
+            status=410,
+        )
+
+    flow_state = json.loads(row["flow_json"])
+    auth_url = flow_state.get("auth_url")
+    if not auth_url:
+        # Pre-PKCE-fix rows won't have a stored auth_url. Tell her to
+        # re-issue. (Once any cached row from before this fix expires,
+        # this branch is dead — but keep it so we don't 500 on the
+        # transition.)
+        return _page(
+            "link expired",
+            "<h1>link expired</h1>"
+            "<p>this link was issued before the PKCE fix. ask suri for a fresh one.</p>",
+            status=410,
+        )
+    return RedirectResponse(url=auth_url, status_code=302)

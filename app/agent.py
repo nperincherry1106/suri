@@ -7,7 +7,7 @@ from datetime import datetime
 from anthropic import Anthropic, APIStatusError
 
 from app import accounts, db
-from app.tools import audit, memory, outlook, plaid as plaid_tool, reminders
+from app.tools import audit, memory, outlook, plaid as plaid_tool, reminders, recurring_reminders
 from app.tools.outlook import OutlookAuthRequired
 
 MODEL = "claude-sonnet-4-5"
@@ -86,6 +86,21 @@ Behavior:
   "turn off the midday check-ins"), call remember_fact with the matching key
   ("morning_brief", "evening_wrap", or "midday_nudge") and value "off";
   forget_fact the same key to turn back on. Confirm which feed she changed.
+- Scheduling (HARD): when she asks for anything at a specific time or on a
+  repeating cadence ("every day at 8pm", "weekdays at noon", "remind me
+  tomorrow at 9"), you MUST call the scheduling tool in the SAME turn —
+  never remember_fact alone for timed requests.
+  - One-shot (specific date/time): set_reminder(when_iso, body)
+  - Repeating (daily / weekdays / weekends / specific days): set_recurring_reminder
+    with hour (0-23), minute (0-59), days, body, and action:
+      push — default; sends the body text at the scheduled time
+      email_scan — daily inbox scan grouped urgent / action needed / FYI
+    Example: "email scan every day at 8pm PT" → set_recurring_reminder(
+    hour=20, minute=0, days="daily", body="daily email scan", action="email_scan")
+  After calling, quote the exact schedule back and verify via the "Active
+  recurring schedules" / "Active scheduled reminders" blocks in ground truth.
+  To cancel: cancel_recurring_reminder(id) or cancel_reminder(id) from list_*.
+  say "turn off my daily email scan" → cancel the email_scan recurring job.
 - When you answer a request, you don't have to be coldly efficient only: if a
   clear next action would help (draft one reply, triage a pile, block a
   sender, set a reminder), end with a single one-line offer — not a menu, one
@@ -692,6 +707,31 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "plaid_unlink",
+        "description": (
+            "Remove a previously-linked Plaid bank item: revokes the access_token "
+            "at Plaid (best-effort /item/remove) and deletes the local row + "
+            "cursor. Use when she asks to disconnect a bank, OR before flipping "
+            "PLAID_ENV from sandbox to production (sandbox tokens stop working "
+            "in prod). Pass either item_id (preferred) or all=true to wipe all "
+            "linked items. Idempotent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item_id": {
+                    "type": "string",
+                    "description": "Plaid item_id from plaid_list_items.",
+                },
+                "all": {
+                    "type": "boolean",
+                    "description": "If true, remove every linked item (e.g. before a sandbox→prod cutover).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "set_reminder",
         "description": (
             "Schedule a reminder pushed to Namrita's Telegram at the given "
@@ -733,6 +773,56 @@ TOOLS = [
             "required": ["id"],
         },
     },
+    {
+        "name": "set_recurring_reminder",
+        "description": (
+            "Schedule a REPEATING push to Namrita's Telegram. Use for 'every "
+            "day at 8pm', 'weekdays at noon', etc. Convert her request to "
+            "hour (0-23), minute (0-59), and days ('daily', 'weekdays', "
+            "'weekends', or comma-separated weekday numbers 0=Mon … 6=Sun).\n\n"
+            "MANDATORY for any recurring/timed habit — do NOT use remember_fact "
+            "instead. action='push' (default) sends body text; action='email_scan' "
+            "runs the inbox scan (urgent / action needed / FYI). Replaces any "
+            "existing job with the same action.\n\n"
+            "After calling, quote the schedule back. Verify in ground truth."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hour": {"type": "integer", "description": "0-23 in the given timezone."},
+                "minute": {"type": "integer", "description": "0-59, default 0."},
+                "body": {"type": "string", "description": "What to remind her about."},
+                "days": {
+                    "type": "string",
+                    "description": "daily | weekdays | weekends | e.g. '0,2,4' for Mon/Wed/Fri.",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["push", "email_scan"],
+                    "description": "push=send body; email_scan=inbox scan.",
+                },
+                "timezone": {
+                    "type": "string",
+                    "description": "IANA tz, default America/Los_Angeles.",
+                },
+            },
+            "required": ["hour", "minute", "body"],
+        },
+    },
+    {
+        "name": "list_recurring_reminders",
+        "description": "List all active recurring schedules.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "cancel_recurring_reminder",
+        "description": "Cancel a recurring schedule by id (from list_recurring_reminders).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"],
+        },
+    },
 ]
 
 _client = None
@@ -745,10 +835,98 @@ def _get_client():
     return _client
 
 
+def _connected_accounts_block() -> str:
+    """What's actually wired up RIGHT NOW. Distinguishes server-side capability
+    (e.g. Plaid keys present) from per-user authorization (e.g. user has linked
+    a bank). Without this block the model conflates the two and falsely tells
+    the user "Plaid isn't wired up" when no items are linked yet."""
+    lines: list[str] = []
+
+    try:
+        outlook_ok = outlook.has_valid_token()
+        accounts = outlook.cached_accounts() if outlook_ok else []
+    except Exception:
+        outlook_ok, accounts = False, []
+    if outlook_ok:
+        who = ", ".join(
+            (a.get("username") or a.get("home_account_id") or "outlook")
+            for a in accounts
+        ) or "outlook"
+        lines.append(f"  - Outlook: CONNECTED ({who}). use Outlook tools freely.")
+    else:
+        lines.append(
+            "  - Outlook: NOT CONNECTED. she needs to authorize via the magic-link flow."
+        )
+
+    try:
+        from app.tools import gmail as gmail_tool  # local import: keeps optional
+        gmail_configured = gmail_tool.is_configured()
+        gmail_ok = gmail_tool.has_valid_token() if gmail_configured else False
+        gmail_user = gmail_tool.account_username() if gmail_ok else None
+    except Exception:
+        gmail_configured, gmail_ok, gmail_user = False, False, None
+    if not gmail_configured:
+        lines.append(
+            "  - Gmail: SERVER NOT CONFIGURED (no GMAIL_CLIENT_ID set). "
+            "tell her you can't see Gmail until the server is set up."
+        )
+    elif gmail_ok:
+        lines.append(
+            f"  - Gmail: CONNECTED ({gmail_user or 'gmail'}). use gmail tools freely."
+        )
+    else:
+        lines.append(
+            "  - Gmail: NOT CONNECTED. she needs to authorize via the magic-link flow "
+            "(any gmail tool call will trigger one)."
+        )
+
+    try:
+        plaid_status = plaid_tool._config_status()
+        plaid_available = plaid_tool.is_configured()
+        plaid_rows = db.list_plaid_items_public()
+    except Exception:
+        plaid_status = {}
+        plaid_available = False
+        plaid_rows = []
+    env = (plaid_status.get("plaid_env") or "sandbox").lower()
+    if plaid_available:
+        if plaid_rows:
+            banks = ", ".join(
+                (p.get("institution_name") or p.get("item_id") or "bank")
+                for p in plaid_rows
+            )
+            lines.append(
+                f"  - Plaid: AVAILABLE ({env}); {len(plaid_rows)} bank item(s) linked: {banks}. "
+                "use plaid_list_items / plaid_sync_transactions / plaid_recurring."
+            )
+        else:
+            lines.append(
+                f"  - Plaid: AVAILABLE ({env}); 0 banks linked. "
+                "this is normal — call plaid_start_link to send her a connect URL. "
+                "DO NOT say 'plaid isn't wired up' or 'backend not configured'; "
+                "the integration is live, she just hasn't linked yet."
+            )
+    else:
+        missing = []
+        if not plaid_status.get("plaid_client_id_set"):
+            missing.append("PLAID_CLIENT_ID")
+        if not plaid_status.get("plaid_secret_set"):
+            missing.append("PLAID_SECRET")
+        if not plaid_status.get("suri_public_url_set"):
+            missing.append("SURI_PUBLIC_URL")
+        lines.append(
+            "  - Plaid: NOT CONFIGURED server-side (missing: "
+            + (", ".join(missing) or "?")
+            + "). do not offer plaid until secrets are set."
+        )
+
+    return "Connected accounts (what's actually wired up RIGHT NOW):\n" + "\n".join(lines)
+
+
 def _ground_truth_block() -> str:
     """The authoritative state of persistent actions, injected into the system
     prompt every turn so the agent can't lie about what it has done."""
-    parts = []
+    parts = [_connected_accounts_block()]
 
     unsubbed = db.list_unsubscribed_senders()
     failed = db.list_failed_unsubscribes()
@@ -776,6 +954,17 @@ def _ground_truth_block() -> str:
         parts.append(f"Active scheduled reminders:\n{lines}")
     else:
         parts.append("Active scheduled reminders: NONE.")
+
+    recurring = db.list_active_recurring_reminders()
+    if recurring:
+        lines = "\n".join(
+            f"  - #{r['id']} {r['hour']:02d}:{r['minute']:02d} {r['days']} "
+            f"({r['action']}): {r['body']}"
+            for r in recurring
+        )
+        parts.append(f"Active recurring schedules:\n{lines}")
+    else:
+        parts.append("Active recurring schedules: NONE.")
 
     plaid_rows = db.list_plaid_items_public()
     if plaid_rows:
@@ -865,11 +1054,31 @@ def _anthropic_transcript_plausible(msgs: list) -> bool:
     return True
 
 
+def _state_has_dangling_tool_use(state: list) -> bool:
+    """True if persisted state ends with assistant tool_use blocks that never
+    got tool_result replies — Claude 400s on these."""
+    if not state or state[-1].get("role") != "assistant":
+        return False
+    content = state[-1].get("content")
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
+
+
 def _load_messages_for_turn() -> list:
     """Prefer the last turn's full Anthropic messages (with tool results).
     If missing or looks corrupt, fall back to text-only _history()."""
     state = db.get_conversation_messages()
     if not state or not isinstance(state, list) or not state:
+        return _history()
+    if _state_has_dangling_tool_use(state):
+        print(
+            "[agent] persisted conversation_state has dangling tool_use; "
+            "clearing and using text-only _history()",
+            file=sys.stderr,
+            flush=True,
+        )
+        db.clear_conversation_state()
         return _history()
     if state[-1].get("role") != "assistant":
         return _history()
@@ -1031,12 +1240,30 @@ def _execute_tool(name: str, input_: dict, turn_id: str):
         result = plaid_tool.sync_transactions(input_.get("item_id"))
     elif name == "plaid_recurring":
         result = plaid_tool.fetch_recurring()
+    elif name == "plaid_unlink":
+        result = plaid_tool.unlink_item(
+            item_id=input_.get("item_id"),
+            all_items=bool(input_.get("all")),
+        )
     elif name == "set_reminder":
         result = reminders.set_reminder(input_["when_iso"], input_["body"])
     elif name == "list_reminders":
         result = reminders.list_reminders()
     elif name == "cancel_reminder":
         result = reminders.cancel_reminder(input_["id"])
+    elif name == "set_recurring_reminder":
+        result = recurring_reminders.set_recurring_reminder(
+            hour=input_["hour"],
+            minute=input_.get("minute", 0),
+            body=input_["body"],
+            days=input_.get("days", "daily"),
+            action=input_.get("action", "push"),
+            timezone=input_.get("timezone", "America/Los_Angeles"),
+        )
+    elif name == "list_recurring_reminders":
+        result = recurring_reminders.list_recurring_reminders()
+    elif name == "cancel_recurring_reminder":
+        result = recurring_reminders.cancel_recurring_reminder(input_["id"])
     elif name == "what_did_you_do":
         result = audit.what_did_you_do(since=input_.get("since", "24h"))
     else:
@@ -1118,13 +1345,14 @@ def handle(send=None) -> list[str]:
             raise
         first_api_in_turn = False
         text = "".join(b.text for b in resp.content if b.type == "text").strip()
-        if text:
+        tool_blocks = [b for b in resp.content if b.type == "tool_use"]
+        if text and not tool_blocks:
             sent.append(text)
             if send:
                 send(text)
 
-        if resp.stop_reason != "tool_use":
-            if any(b.type in ("text", "tool_use") for b in resp.content):
+        if not tool_blocks:
+            if any(b.type == "text" for b in resp.content):
                 messages.append(
                     {"role": "assistant", "content": _serialize(resp.content)}
                 )
@@ -1138,11 +1366,14 @@ def handle(send=None) -> list[str]:
                 )
             return sent
 
+        if text:
+            sent.append(text)
+            if send:
+                send(text)
+
         messages.append({"role": "assistant", "content": _serialize(resp.content)})
         tool_results = []
-        for block in resp.content:
-            if block.type != "tool_use":
-                continue
+        for block in tool_blocks:
             try:
                 result = _execute_tool(block.name, block.input, turn_id)
             except OutlookAuthRequired as e:

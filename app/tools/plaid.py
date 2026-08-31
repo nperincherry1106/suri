@@ -57,14 +57,33 @@ def _get_client():
 
 
 def _client_user_id() -> str:
-    u = os.environ.get("TELEGRAM_USER_ID", "").strip()
-    return f"suri-user-{u}" if u else "suri-user-default"
+    """Stable per-user ID handed to Plaid /user/create. Single-user app, so a
+    fixed string is fine; pinning Namrita's Apple sub here once it's known
+    would also work but isn't worth churning the existing Plaid user record."""
+    return "suri-user-default"
+
+
+def _plaid_user_fact_key() -> str:
+    """Plaid /user/create IDs are per-environment — sandbox IDs break in production."""
+    env = _plaid_env_label()
+    if env == "production":
+        return "plaid_user_id_production"
+    if env in ("development", "dev"):
+        return "plaid_user_id_development"
+    return "plaid_user_id_sandbox"
 
 
 def _get_or_create_plaid_api_user_id(client) -> tuple[str | None, str | None]:
     """Plaid `user_id` from /user/create — required when using multi-item Link (Dec 2025+).
-    Persisted in user_facts. Returns (user_id, error_message)."""
-    existing = db.user_facts().get("plaid_user_id", "").strip()
+    Persisted in user_facts per PLAID_ENV. Returns (user_id, error_message)."""
+    key = _plaid_user_fact_key()
+    existing = db.user_facts().get(key, "").strip()
+    if not existing:
+        legacy = db.user_facts().get("plaid_user_id", "").strip()
+        if legacy and key == "plaid_user_id_sandbox":
+            existing = legacy
+        elif legacy:
+            db.forget_fact("plaid_user_id")
     if existing:
         return existing, None
     from plaid.model.user_create_request import UserCreateRequest
@@ -77,7 +96,9 @@ def _get_or_create_plaid_api_user_id(client) -> tuple[str | None, str | None]:
         uid = d.get("user_id") or (getattr(r, "user_id", None) if not d else None)
         if not uid:
             return None, "plaid /user/create returned no user_id (check Plaid dashboard / API access)"
-        db.set_fact("plaid_user_id", str(uid))
+        db.set_fact(key, str(uid))
+        if key != "plaid_user_id":
+            db.forget_fact("plaid_user_id")
         return str(uid), None
     except Exception as e:
         err = _plaid_error(e)
@@ -143,31 +164,98 @@ def _config_status() -> dict:
     }
 
 
-def _serialize_tx(t) -> dict:
+def _to_dict(t) -> dict:
+    """Coerce a Plaid SDK model OR dict into a plain dict so downstream
+    extractors don't have to fork on type. SDK objects expose to_dict()."""
     if isinstance(t, dict):
-        amt = t.get("amount")
-        dts = t.get("date") or t.get("authorized_date")
-        if dts is not None and not isinstance(dts, str) and hasattr(dts, "isoformat"):
-            dts = dts.isoformat()
-        elif dts is not None:
-            dts = str(dts)
-        name = t.get("name") or ""
-        mch = t.get("merchant_name") or ""
-    else:
-        amt = getattr(t, "amount", None)
-        dt = getattr(t, "date", None) or getattr(t, "authorized_date", None)
-        if hasattr(dt, "isoformat"):
-            dts = dt.isoformat()
-        else:
-            dts = str(dt) if dt is not None else None
-        name = getattr(t, "name", None) or ""
-        mch = getattr(t, "merchant_name", None) or ""
+        return t
+    if hasattr(t, "to_dict"):
+        try:
+            return t.to_dict()
+        except Exception:
+            pass
+    return {k: getattr(t, k) for k in dir(t) if not k.startswith("_")}
+
+
+def _iso(d) -> str | None:
+    if d is None:
+        return None
+    if hasattr(d, "isoformat"):
+        return d.isoformat()
+    return str(d)
+
+
+def _serialize_tx(t) -> dict:
+    """Compact representation used in the agent's tool-output sample (kept
+    short on purpose — the model doesn't need 30 fields per tx)."""
+    d = _to_dict(t)
+    amt = d.get("amount")
     return {
-        "date": dts,
+        "date": _iso(d.get("date") or d.get("authorized_date")),
         "amount": float(amt) if amt is not None else None,
-        "name": str(name)[:200],
-        "merchant_name": str(mch)[:200] if mch else None,
+        "name": str(d.get("name") or "")[:200],
+        "merchant_name": str(d.get("merchant_name") or "")[:200] or None,
     }
+
+
+def _persist_tx(t, item_id: str) -> str | None:
+    """Upsert a single Plaid transaction into the local DB. Returns the
+    transaction_id on success, or None if the payload was missing the
+    required fields (we log + skip rather than crash the sync loop)."""
+    d = _to_dict(t)
+    txid = d.get("transaction_id")
+    date = _iso(d.get("date") or d.get("authorized_date"))
+    amt = d.get("amount")
+    if not txid or not date or amt is None:
+        print(
+            f"[plaid] skipping tx with missing required fields: "
+            f"id={txid!r} date={date!r} amount={amt!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    pcc = d.get("personal_finance_category") or {}
+    if not isinstance(pcc, dict):
+        pcc = _to_dict(pcc)
+    raw_min = {
+        k: d.get(k)
+        for k in (
+            "transaction_id", "account_id", "amount", "iso_currency_code",
+            "date", "authorized_date", "name", "merchant_name", "pending",
+            "personal_finance_category", "payment_channel", "category",
+            "category_id", "transaction_type",
+        )
+        if k in d
+    }
+    db.upsert_plaid_transaction(
+        transaction_id=str(txid),
+        item_id=item_id,
+        account_id=d.get("account_id"),
+        amount=float(amt),
+        iso_currency_code=d.get("iso_currency_code"),
+        date=date,
+        authorized_date=_iso(d.get("authorized_date")),
+        name=(d.get("name") or "")[:300] or None,
+        merchant_name=(d.get("merchant_name") or "")[:300] or None,
+        pending=bool(d.get("pending")),
+        category_primary=(pcc.get("primary") if isinstance(pcc, dict) else None),
+        category_detailed=(pcc.get("detailed") if isinstance(pcc, dict) else None),
+        payment_channel=d.get("payment_channel"),
+        raw_json=json.dumps(raw_min, default=str),
+    )
+    return str(txid)
+
+
+def _transactions_sync_request(access_token: str, cursor: str | None, count: int = 200):
+    """Plaid's SDK rejects cursor=None (must be str); omit the field for first-time sync."""
+    from plaid.model.transactions_sync_request import TransactionsSyncRequest
+
+    c = (cursor or "").strip()
+    if c:
+        return TransactionsSyncRequest(
+            access_token=access_token, cursor=c, count=count
+        )
+    return TransactionsSyncRequest(access_token=access_token, count=count)
 
 
 def start_link() -> dict:
@@ -364,12 +452,155 @@ def _exchange_public_token_impl(public_token: str) -> dict:
     }
 
 
-def sync_transactions(item_id: str | None) -> dict:
-    """Run /transactions/sync for one or all items; returns added slice + cursor progress."""
+def unlink_item(item_id: str | None = None, all_items: bool = False) -> dict:
+    """Remove one Plaid item (or all of them) from the DB and revoke the
+    access_token via Plaid /item/remove. Idempotent — Plaid 4xx errors do not
+    block the local delete (e.g. if the env was switched and the token is now
+    invalid for the new env). Used to clean up sandbox items before cutting
+    over to production Plaid."""
+    if not item_id and not all_items:
+        return {
+            "ok": False,
+            "error": "pass item_id, or set all_items=true to remove every linked item",
+        }
+
+    targets: list[dict] = []
+    if all_items:
+        for p in db.list_plaid_items_public():
+            row = db.get_plaid_item(p["item_id"])
+            if row:
+                targets.append(row)
+    else:
+        row = db.get_plaid_item(str(item_id))
+        if row is None:
+            return {"ok": False, "error": f"unknown item_id: {item_id}"}
+        targets.append(row)
+
+    if not targets:
+        return {"ok": True, "removed": [], "note": "no linked items to remove"}
+
+    client = _get_client()
+    removed: list[dict] = []
+    plaid_errors: list[dict] = []
+    for row in targets:
+        iid = row["item_id"]
+        at = row["access_token"]
+        nm = row.get("institution_name") or iid
+        if client is not None:
+            try:
+                from plaid.model.item_remove_request import ItemRemoveRequest
+
+                client.item_remove(ItemRemoveRequest(access_token=at))
+            except Exception as e:
+                plaid_errors.append({"item_id": iid, "error": _plaid_error(e)})
+                print(
+                    f"[plaid] item_remove non-fatal: item_id={iid} err={_plaid_error(e)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        try:
+            db.delete_plaid_item(iid)
+        except Exception as e:
+            plaid_errors.append(
+                {"item_id": iid, "error": f"sqlite delete failed: {e}"}
+            )
+            continue
+        removed.append({"item_id": iid, "institution_name": nm})
+
+    return {
+        "ok": True,
+        "removed": removed,
+        "plaid_errors": plaid_errors,
+        "note": (
+            "access_token revoked at Plaid (best-effort) and row deleted locally. "
+            "if you switched PLAID_ENV, plaid_errors are expected — local rows are gone either way."
+        ),
+    }
+
+
+def _duplicate_public_token_error(err: str) -> bool:
+    u = (err or "").upper()
+    if "INVALID_PUBLIC_TOKEN" in u:
+        return True
+    if "INVALID" in u and "PUBLIC" in u and "TOKEN" in u:
+        return True
+    return False
+
+
+def process_link_webhook(body: dict) -> dict:
+    """Multi-Item Link does not call the browser onSuccess with a public_token; Plaid
+    sends public_token(s) in LINK webhooks (SESSION_FINISHED, ITEM_ADD_RESULT)."""
+    wtype = (body.get("webhook_type") or "").strip().upper()
+    wcode = body.get("webhook_code")
+    if wtype and wtype != "LINK":
+        return {"ok": True, "ignored": True, "webhook_type": wtype}
+    if wcode not in ("SESSION_FINISHED", "ITEM_ADD_RESULT"):
+        return {"ok": True, "ignored": True, "webhook_code": wcode}
+    tokens: list[str] = []
+    if wcode == "SESSION_FINISHED":
+        if (body.get("status") or "").strip().upper() != "SUCCESS":
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "status_not_success",
+                "status": body.get("status"),
+            }
+        for t in body.get("public_tokens") or []:
+            if isinstance(t, str) and t:
+                tokens.append(t)
+        leg = body.get("public_token")
+        if isinstance(leg, str) and leg and leg not in tokens:
+            tokens.append(leg)
+    else:
+        pt = body.get("public_token")
+        if isinstance(pt, str) and pt:
+            tokens.append(pt)
+    tokens = list(dict.fromkeys(tokens))
+    if not tokens:
+        return {"ok": True, "exchanged_item_ids": [], "note": "no public_token(s) in payload"}
+    exchanged: list[str] = []
+    errors: list[dict] = []
+    for pt in tokens:
+        r = exchange_public_token(pt)
+        if r.get("ok"):
+            eid = r.get("item_id")
+            if eid:
+                exchanged.append(str(eid))
+            print(
+                f"[plaid] LINK webhook item linked item_id={eid}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        emsg = r.get("error") or ""
+        if _duplicate_public_token_error(emsg):
+            print(
+                f"[plaid] LINK webhook skip already-used public_token: {emsg[:160]}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            errors.append(
+                {
+                    "error": emsg,
+                    "token_tail": pt[-12:] if len(pt) > 12 else pt,
+                }
+            )
+    return {
+        "exchanged_item_ids": exchanged,
+        "errors": errors,
+    }
+
+
+def sync_transactions(item_id: str | None, reset_cursor: bool = False) -> dict:
+    """Run /transactions/sync for one or all items; persists added/modified
+    transactions and removes deletions. Returns per-item counts + a small
+    sample of newly-added rows. If reset_cursor=True, wipes the cursor
+    first so we re-pull the entire history (useful for backfill after
+    adding the local plaid_transactions table)."""
     client = _get_client()
     if client is None:
         return {"ok": False, "error": "plaid not configured"}
-    from plaid.model.transactions_sync_request import TransactionsSyncRequest
 
     rows = []
     if item_id:
@@ -395,15 +626,18 @@ def sync_transactions(item_id: str | None) -> dict:
     for row in rows:
         iid = row["item_id"]
         at = row["access_token"]
-        cur = row.get("cursor")
+        cur = None if reset_cursor else row.get("cursor")
+        if reset_cursor:
+            db.set_plaid_cursor(iid, None)
         try:
             added: list[dict] = []
+            n_added = 0
+            n_modified = 0
+            n_removed = 0
             has_more = True
             n_cursor: str | None = cur
             while has_more:
-                req = TransactionsSyncRequest(
-                    access_token=at, cursor=n_cursor, count=200
-                )
+                req = _transactions_sync_request(at, n_cursor, 200)
                 resp = client.transactions_sync(req)
                 d = (
                     resp.to_dict()
@@ -412,6 +646,21 @@ def sync_transactions(item_id: str | None) -> dict:
                 )
                 for t in d.get("added") or []:
                     added.append(_serialize_tx(t))
+                    if _persist_tx(t, iid):
+                        n_added += 1
+                for t in d.get("modified") or []:
+                    if _persist_tx(t, iid):
+                        n_modified += 1
+                removed_ids = []
+                for r in d.get("removed") or []:
+                    if isinstance(r, dict):
+                        rid = r.get("transaction_id")
+                    else:
+                        rid = getattr(r, "transaction_id", None)
+                    if rid:
+                        removed_ids.append(str(rid))
+                if removed_ids:
+                    n_removed += db.delete_plaid_transactions(removed_ids)
                 has_more = bool(d.get("has_more"))
                 n_cursor = d.get("next_cursor")
             db.set_plaid_cursor(iid, n_cursor)
@@ -420,6 +669,9 @@ def sync_transactions(item_id: str | None) -> dict:
                     "item_id": iid,
                     "institution_name": row.get("institution_name"),
                     "new_transactions_fetched": len(added),
+                    "persisted_added": n_added,
+                    "persisted_modified": n_modified,
+                    "persisted_removed": n_removed,
                     "sample": added[:15],
                 }
             )

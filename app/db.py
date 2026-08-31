@@ -128,7 +128,108 @@ def init():
                 link_token TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            -- iOS device push tokens. Single-user app today, but keeping the
+            -- table per-device (not per-user) so the iOS-on-iPhone +
+            -- iOS-on-iPad case works once she has both. apns_env is either
+            -- 'production' (TestFlight / App Store builds) or 'sandbox'
+            -- (Xcode debug builds straight to a USB-attached device); the
+            -- iOS app reports which one it is at registration time.
+            CREATE TABLE IF NOT EXISTS devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                apns_token TEXT NOT NULL UNIQUE,
+                apns_env TEXT NOT NULL DEFAULT 'production',
+                bundle_id TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'ios',
+                active INTEGER NOT NULL DEFAULT 1,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_devices_active
+                ON devices(active, apns_env);
+            -- Sessions issued after a successful Sign in with Apple. The
+            -- iOS app stores the `session_jwt` in the keychain and presents
+            -- it on every /api/v1/* call. We persist a row per JWT so we
+            -- can revoke individual sessions later (e.g. "log out this
+            -- device") without rotating the global signing secret.
+            CREATE TABLE IF NOT EXISTS app_sessions (
+                jti TEXT PRIMARY KEY,
+                apple_sub TEXT NOT NULL,
+                issued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                last_seen_at DATETIME,
+                user_agent TEXT,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                revoked_at DATETIME
+            );
+            CREATE INDEX IF NOT EXISTS idx_app_sessions_sub
+                ON app_sessions(apple_sub, revoked);
+            -- Persisted transactions from Plaid /transactions/sync. Today
+            -- sync() returns added+modified+removed slices that we discard
+            -- after extracting a sample; storing them locally turns the
+            -- Finances tab into a fast SQLite read instead of a per-render
+            -- Plaid round-trip, and unlocks aggregations (today's spend,
+            -- weekly digest) that would otherwise require either re-pulling
+            -- everything or paying Plaid for /transactions/get on every load.
+            -- Plaid's `amount` convention: positive = outflow (you spent),
+            -- negative = inflow (refund / credit). We preserve that sign.
+            CREATE TABLE IF NOT EXISTS plaid_transactions (
+                transaction_id TEXT PRIMARY KEY,
+                item_id TEXT NOT NULL,
+                account_id TEXT,
+                amount REAL NOT NULL,
+                iso_currency_code TEXT,
+                date TEXT NOT NULL,
+                authorized_date TEXT,
+                name TEXT,
+                merchant_name TEXT,
+                pending INTEGER NOT NULL DEFAULT 0,
+                category_primary TEXT,
+                category_detailed TEXT,
+                payment_channel TEXT,
+                raw_json TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_plaid_tx_date
+                ON plaid_transactions(date DESC);
+            CREATE INDEX IF NOT EXISTS idx_plaid_tx_item
+                ON plaid_transactions(item_id, date DESC);
+            CREATE INDEX IF NOT EXISTS idx_plaid_tx_pending
+                ON plaid_transactions(pending);
+            CREATE TABLE IF NOT EXISTS recurring_reminders (
+                id INTEGER PRIMARY KEY,
+                hour INTEGER NOT NULL,
+                minute INTEGER NOT NULL DEFAULT 0,
+                days TEXT NOT NULL DEFAULT 'daily',
+                timezone TEXT NOT NULL DEFAULT 'America/Los_Angeles',
+                body TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT 'push',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_fired_at DATETIME
+            );
             """
+        )
+    _migrate_recurring_from_facts()
+
+
+def _migrate_recurring_from_facts():
+    """One-time-style migration: legacy daily_email_scan user_facts become a
+    recurring job so existing Fly installs keep the 8pm scan after deploy."""
+    fact = user_facts().get("daily_email_scan", "").strip()
+    if not fact or fact.lower() == "off":
+        return
+    with conn() as c:
+        existing = c.execute(
+            "SELECT id FROM recurring_reminders "
+            "WHERE action = 'email_scan' AND status = 'active' LIMIT 1"
+        ).fetchone()
+        if existing:
+            return
+        c.execute(
+            "INSERT INTO recurring_reminders (hour, minute, days, body, action) "
+            "VALUES (20, 0, 'daily', ?, 'email_scan')",
+            (fact,),
         )
 
 
@@ -461,6 +562,80 @@ def mark_reminder_cancelled(reminder_id: int):
         )
 
 
+def create_recurring_reminder(
+    hour: int,
+    minute: int,
+    days: str,
+    body: str,
+    action: str = "push",
+    timezone: str = "America/Los_Angeles",
+) -> int:
+    with conn() as c:
+        cur = c.execute(
+            "INSERT INTO recurring_reminders "
+            "(hour, minute, days, timezone, body, action) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (hour, minute, days, timezone, body, action),
+        )
+        return cur.lastrowid
+
+
+def get_recurring_reminder(recurring_id: int):
+    with conn() as c:
+        row = c.execute(
+            "SELECT id, hour, minute, days, timezone, body, action, status, "
+            "last_fired_at FROM recurring_reminders WHERE id = ?",
+            (recurring_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def list_active_recurring_reminders():
+    with conn() as c:
+        rows = c.execute(
+            "SELECT id, hour, minute, days, timezone, body, action, last_fired_at "
+            "FROM recurring_reminders WHERE status = 'active' "
+            "ORDER BY hour, minute, id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_recurring_cancelled(recurring_id: int):
+    with conn() as c:
+        c.execute(
+            "UPDATE recurring_reminders SET status = 'cancelled' WHERE id = ?",
+            (recurring_id,),
+        )
+
+
+def touch_recurring_fired(recurring_id: int):
+    with conn() as c:
+        c.execute(
+            "UPDATE recurring_reminders SET last_fired_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (recurring_id,),
+        )
+
+
+def cancel_recurring_by_action(action: str) -> int | None:
+    """Cancel active recurring job(s) with this action. Returns cancelled id."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT id FROM recurring_reminders "
+            "WHERE action = ? AND status = 'active' LIMIT 1",
+            (action,),
+        ).fetchone()
+        if row is None:
+            return None
+        c.execute(
+            "UPDATE recurring_reminders SET status = 'cancelled' WHERE id = ?",
+            (row["id"],),
+        )
+        return row["id"]
+
+
 def upsert_paid_subscription(
     service_name: str,
     sender_domain: str | None,
@@ -714,3 +889,221 @@ def list_plaid_items_public():
 def delete_plaid_item(item_id: str):
     with conn() as c:
         c.execute("DELETE FROM plaid_items WHERE item_id = ?", (item_id,))
+
+
+# ---------------------------------------------------------------------------
+# devices (APNs targets)
+# ---------------------------------------------------------------------------
+
+
+def register_device(
+    apns_token: str,
+    bundle_id: str,
+    apns_env: str = "production",
+    platform: str = "ios",
+) -> int:
+    """Idempotent upsert by apns_token. Bumps last_seen and re-activates if
+    the token had previously been deactivated (a user can revoke and re-grant
+    notification permission). Returns the row id."""
+    env = (apns_env or "production").strip().lower()
+    if env not in ("production", "sandbox"):
+        env = "production"
+    with conn() as c:
+        c.execute(
+            "INSERT INTO devices (apns_token, apns_env, bundle_id, platform, active, last_seen) "
+            "VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(apns_token) DO UPDATE SET "
+            "  apns_env = excluded.apns_env, "
+            "  bundle_id = excluded.bundle_id, "
+            "  platform = excluded.platform, "
+            "  active = 1, "
+            "  last_seen = CURRENT_TIMESTAMP",
+            (apns_token, env, bundle_id, platform),
+        )
+        row = c.execute(
+            "SELECT id FROM devices WHERE apns_token = ?", (apns_token,)
+        ).fetchone()
+    return int(row["id"])
+
+
+def list_active_devices() -> list[dict]:
+    """All devices currently eligible for push. Caller groups by apns_env to
+    pick the right APNs host (production vs sandbox)."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT id, apns_token, apns_env, bundle_id, platform, last_seen, created_at "
+            "FROM devices WHERE active = 1 ORDER BY id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def deactivate_device(apns_token: str) -> None:
+    """Called when APNs returns 410 Unregistered (app was uninstalled or the
+    user disabled notifications). We don't delete the row — keeping it lets
+    re-registration with the same token preserve history."""
+    with conn() as c:
+        c.execute(
+            "UPDATE devices SET active = 0 WHERE apns_token = ?",
+            (apns_token,),
+        )
+
+
+# ---------------------------------------------------------------------------
+# app_sessions (JWTs issued after Sign in with Apple)
+# ---------------------------------------------------------------------------
+
+
+def create_app_session(
+    jti: str,
+    apple_sub: str,
+    expires_at: str,
+    user_agent: str | None = None,
+) -> None:
+    """Persist a freshly-issued session. `jti` is the JWT's unique id (claim
+    'jti'); revocation works by setting revoked=1 here so a stolen token
+    can be killed without rotating the signing secret."""
+    with conn() as c:
+        c.execute(
+            "INSERT INTO app_sessions (jti, apple_sub, expires_at, user_agent) "
+            "VALUES (?, ?, ?, ?)",
+            (jti, apple_sub, expires_at, user_agent),
+        )
+
+
+def get_app_session(jti: str) -> dict | None:
+    with conn() as c:
+        row = c.execute(
+            "SELECT jti, apple_sub, issued_at, expires_at, last_seen_at, "
+            "user_agent, revoked, revoked_at "
+            "FROM app_sessions WHERE jti = ?",
+            (jti,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def touch_app_session(jti: str) -> None:
+    """Bump last_seen_at on every authenticated request. Cheap signal we
+    can use later for 'idle for 90 days, revoke' policies."""
+    with conn() as c:
+        c.execute(
+            "UPDATE app_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE jti = ?",
+            (jti,),
+        )
+
+
+def revoke_app_session(jti: str) -> None:
+    with conn() as c:
+        c.execute(
+            "UPDATE app_sessions "
+            "SET revoked = 1, revoked_at = CURRENT_TIMESTAMP WHERE jti = ?",
+            (jti,),
+        )
+
+
+# ---------------------------------------------------------------------------
+# plaid_transactions (persisted from /transactions/sync)
+# ---------------------------------------------------------------------------
+
+
+def upsert_plaid_transaction(
+    transaction_id: str,
+    item_id: str,
+    account_id: str | None,
+    amount: float,
+    iso_currency_code: str | None,
+    date: str,
+    authorized_date: str | None,
+    name: str | None,
+    merchant_name: str | None,
+    pending: bool,
+    category_primary: str | None,
+    category_detailed: str | None,
+    payment_channel: str | None,
+    raw_json: str | None,
+) -> None:
+    """Idempotent upsert. Plaid sometimes re-emits transactions in the
+    `modified` slice (e.g. category re-classification, pending->posted with
+    same id) so we always overwrite mutable fields and refresh updated_at."""
+    with conn() as c:
+        c.execute(
+            "INSERT INTO plaid_transactions ("
+            "  transaction_id, item_id, account_id, amount, iso_currency_code, "
+            "  date, authorized_date, name, merchant_name, pending, "
+            "  category_primary, category_detailed, payment_channel, raw_json"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(transaction_id) DO UPDATE SET "
+            "  item_id = excluded.item_id, "
+            "  account_id = excluded.account_id, "
+            "  amount = excluded.amount, "
+            "  iso_currency_code = excluded.iso_currency_code, "
+            "  date = excluded.date, "
+            "  authorized_date = excluded.authorized_date, "
+            "  name = excluded.name, "
+            "  merchant_name = excluded.merchant_name, "
+            "  pending = excluded.pending, "
+            "  category_primary = excluded.category_primary, "
+            "  category_detailed = excluded.category_detailed, "
+            "  payment_channel = excluded.payment_channel, "
+            "  raw_json = excluded.raw_json, "
+            "  updated_at = CURRENT_TIMESTAMP",
+            (
+                transaction_id, item_id, account_id, float(amount), iso_currency_code,
+                date, authorized_date, name, merchant_name, 1 if pending else 0,
+                category_primary, category_detailed, payment_channel, raw_json,
+            ),
+        )
+
+
+def delete_plaid_transactions(transaction_ids: list[str]) -> int:
+    """Used by sync() to apply the `removed` slice when Plaid drops a tx
+    (e.g. pending tx that never posted). Returns rows affected."""
+    if not transaction_ids:
+        return 0
+    with conn() as c:
+        cur = c.execute(
+            "DELETE FROM plaid_transactions WHERE transaction_id IN "
+            f"({','.join('?' for _ in transaction_ids)})",
+            transaction_ids,
+        )
+        return cur.rowcount
+
+
+def list_plaid_transactions(
+    days: int | None = 30,
+    limit: int = 200,
+    item_id: str | None = None,
+) -> list[dict]:
+    """Return transactions sorted by date desc. `days=None` means no date
+    filter (use sparingly — could be thousands of rows)."""
+    where: list[str] = []
+    args: list = []
+    if days is not None:
+        where.append("date >= date('now', ?)")
+        args.append(f"-{int(days)} days")
+    if item_id:
+        where.append("item_id = ?")
+        args.append(item_id)
+    sql = (
+        "SELECT transaction_id, item_id, account_id, amount, iso_currency_code, "
+        "date, authorized_date, name, merchant_name, pending, "
+        "category_primary, category_detailed, payment_channel "
+        "FROM plaid_transactions"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY date DESC, transaction_id DESC LIMIT ?"
+    args.append(int(limit))
+    with conn() as c:
+        rows = c.execute(sql, tuple(args)).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        d["pending"] = bool(d["pending"])
+        out.append(d)
+    return out
+
+
+def count_plaid_transactions() -> int:
+    with conn() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM plaid_transactions").fetchone()
+    return int(row["n"]) if row else 0

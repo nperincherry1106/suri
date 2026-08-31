@@ -35,6 +35,11 @@ AUTHORITY = "https://login.microsoftonline.com/consumers"
 # (2) re-consent. Suri handles (2) inline — adding a scope to SCOPES forces
 # the next silent acquire to fail, which kicks the user into the magic-link
 # (or device-code) consent flow on the next tool call automatically.
+# NOTE: find_owed_replies needs User.Read scope to call Graph /me. Adding it
+# here forces a token re-auth (MSAL silent refresh fails when the consented
+# scopes don't match), which broke /inbox/triage in step 7 of the iOS plan.
+# Held back until next user-initiated re-auth (e.g. fresh Outlook setup or
+# explicit "reconnect" tap from the iOS app's Your Suri tab).
 SCOPES = ["Mail.ReadWrite", "MailboxSettings.ReadWrite", "Calendars.ReadWrite"]
 GRAPH = "https://graph.microsoft.com/v1.0"
 ROOT = Path(__file__).parent.parent.parent
@@ -137,15 +142,13 @@ def _start_magic_link_flow(app: msal.PublicClientApplication, redirect_uri: str)
     recent = db.recent_messages(1)
     original_prompt = recent[0][1] if recent and recent[0][0] == "inbound" else None
 
-    telegram_user_id_str = os.environ.get("TELEGRAM_USER_ID")
-    if not telegram_user_id_str:
-        raise RuntimeError("missing TELEGRAM_USER_ID — can't route OAuth callback")
-
     db.create_pending_oauth(
         state=flow["state"],
         provider="outlook",
         flow_json=json.dumps(flow),
-        telegram_user_id=int(telegram_user_id_str),
+        # Vestigial column from the Telegram era; kept on the table to avoid
+        # a migration. Single-user app, so a sentinel 0 is fine.
+        telegram_user_id=0,
         original_prompt=original_prompt,
     )
 
@@ -396,6 +399,7 @@ def find_marketing_senders():
                 "last_seen": latest.date().isoformat(),
                 "sample_subjects": b["subjects"][:3],
                 "one_click_supported": b["post_supported"],
+                "source": "outlook",
             }
         )
     results.sort(key=lambda r: (r["email_count"], r["last_seen"]), reverse=True)
@@ -991,6 +995,7 @@ def triage_inbox(hours_back: int = 24, max_results: int = 30):
                 "received_at": msg.get("receivedDateTime"),
                 "is_unread": not msg.get("isRead", True),
                 "is_marketing": url is not None,
+                "source": "outlook",
             }
         )
     return out
@@ -1098,6 +1103,7 @@ def find_owed_replies(days_threshold: int = 2, lookback_days: int = 14):
                 "subject": m.get("subject"),
                 "received_at": m["receivedDateTime"],
                 "days_waiting": (now_utc - received).days,
+                "source": "outlook",
             }
         )
 
